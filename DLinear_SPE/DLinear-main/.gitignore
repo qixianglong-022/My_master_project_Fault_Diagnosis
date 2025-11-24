@@ -157,4 +157,32 @@ cython_debug/
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+.idea/
+
+# ==========================
+# My Project Specific Ignores
+# ==========================
+
+# 1. 训练产生的大量日志和权重 (体积巨大，必须忽略)
+output/
+runs/
+logs/
+checkpoints/
+results/
+
+# 2. 模型文件 (如果你不想传几百MB的模型参数)
+*.pth
+*.pt
+*.pkl
+*.ckpt
+
+# 3. 数据集文件 (只传代码，不传数据)
+TimeseriesData/
+datasets/data/
+*.csv
+*.xlsx
+*.xls
+
+# 4. 临时测试图或文档
+*.log
+*.bak
