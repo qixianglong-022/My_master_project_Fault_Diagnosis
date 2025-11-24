@@ -1,17 +1,12 @@
-""" ImageNet Training Script
-
-This is intended to be a lean and easily modifiable ImageNet training script that reproduces ImageNet
-training results with some of the latest networks and training techniques. It favours canonical PyTorch
-and standard Python style over trying to be able to 'do it all.' That said, it offers quite a few speed
-and training result improvements over the usual PyTorch example scripts. Repurpose as you see fit.
-
-This script was started from an early version of the PyTorch ImageNet example
-(https://github.com/pytorch/examples/tree/master/imagenet)
-
-NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
-(https://github.com/NVIDIA/apex/tree/master/examples/imagenet)
-
-Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
+""" ImageNet Training Script (基于 DLinear 修改版)
+这个脚本是整个训练、验证和测试的入口。
+它负责：
+1. 解析命令行参数 (Epochs, Batch_size, 数据路径等)
+2. 加载数据 (Dataset & DataLoader)
+3. 初始化模型 (DLinear)
+4. 定义优化器和损失函数
+5. 执行训练循环 (Train -> Validate -> Save Checkpoint)
+6. [新增] 执行异常检测评估 (SPE + POT)
 """
 import argparse
 import datetime
@@ -23,7 +18,7 @@ import json
 import os
 from pathlib import Path
 from timm.utils import NativeScaler, get_state_dict, ModelEma
-
+from util.anomaly_utils import AnomalyMeasurer  # [核心工具] 引入我们写的异常检测工具类
 
 from util.samplers import RASampler
 from util import utils as utils
@@ -33,158 +28,158 @@ from util.engine import train_one_epoch, evaluate
 from util.lr_sched import create_lr_scheduler
 
 from datasets import build_dataset
+from models import DLinear  # 我们主要关注 DLinear
 
-from models import DLinear, Informer, Reformer, FEDFormer, Transformer, AutoFormer, NLinear, Linear
+# 其他模型虽然引入了，但在你的论文中如果不用，可以后续清理掉
+from models import Informer, Reformer, FEDFormer, Transformer, AutoFormer, NLinear, Linear
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('TimeSeriesModelSoups training and evaluation script', add_help=False)
-    parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--epochs', default=5, type=int)
-    parser.add_argument('--loss_type', default='RMSE', type=str,
-                        choices=['MAE', 'MSE', 'RMSE', 'MAPE', 'MSPE', 'RSE', 'CORR'])
+    parser = argparse.ArgumentParser('DLinear Training and Evaluation Script', add_help=False)
 
-    # Dataset parameters
-    parser.add_argument('--data', type=str, default='ETTh2', help='dataset type')
-    parser.add_argument('--root_path', type=str, default=r'D:\Darwin_base\My_Knowledge_Base\5_项目实践 (Projects)\Project_A_Fault_Diagnosis\Dlinear\DLinear-main\DLinear-main\TimeseriesData',
-                        help='root path of the data file')
-    parser.add_argument('--data_path', type=str, default='ETTh2.csv', help='data file')
+    # =========================
+    # 1. 基础训练参数 (Basic Training)
+    # =========================
+    parser.add_argument('--batch_size', default=32, type=int, help='批大小')
+    parser.add_argument('--epochs', default=10, type=int, help='训练轮数')
+    parser.add_argument('--loss_type', default='MSE', type=str,
+                        choices=['MAE', 'MSE', 'RMSE', 'MAPE', 'MSPE', 'RSE', 'CORR'],
+                        help='损失函数类型，推荐 MSE')
+
+    # =========================
+    # 2. 数据集参数 (Data)
+    # =========================
+    # parser.add_argument('--data', type=str, default='custom', help='数据集类型')
+    # parser.add_argument('--root_path', type=str, default='./TimeseriesData', help='数据根目录')
+    # parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='数据文件名')
     parser.add_argument('--features', type=str, default='M',
-                        help='forecasting task, options:[M, S, MS]; M:multivariate predict multivariate, S:univariate predict univariate, MS:multivariate predict univariate')
-    parser.add_argument('--target', type=str, default='OT', help='target feature in S or MS task')
+                        help='预测任务: [M]多变量预测多变量, [S]单变量预测单变量, [MS]多变量预测单变量')
+    parser.add_argument('--target', type=str, default='OT', help='目标列名(S或MS任务用)')
     parser.add_argument('--freq', type=str, default='h',
-                        help='freq for time features encoding, options:[s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly], you can also use more detailed freq like 15min or 3h')
-
-    # Model parameters
-    parser.add_argument('--model', default='Informer', type=str, metavar='MODEL',
-                        choices=['DLinear', 'Informer', 'Reformer', 'FEDFormer', 'Transformer', 'AutoFormer', 'NLinear', 'Linear'],
-                        help='Name of model to train')
-    parser.add_argument('--train_only', type=bool, default=False,
-                        help='perform training on full input dataset without validation and testing')
-    parser.add_argument('--seq_len', type=int, default=96)
-    parser.add_argument('--pred_len', type=int, default=720,
-                        choices=[96, 192, 336, 720], help='24 36 48 60 for national_illness dataset')
-    parser.add_argument('--label_len', type=int, default=48, help='start token length')
-    parser.add_argument('--individual', action='store_true', default=False,
-                        help='DLinear: a linear layer for each variate(channel) individually')
-    # Formers
-    parser.add_argument('--embed_type', type=int, default=3,
-                        help='0: default 1: value embedding + temporal embedding + positional embedding 2: value embedding + temporal embedding 3: value embedding + positional embedding 4: value embedding')
-    parser.add_argument('--enc_in', type=int, default=7,
-                        help='encoder input size')  # DLinear with --individual, use this hyperparameter as the number of channels
-    parser.add_argument('--dec_in', type=int, default=7, help='decoder input size')
-    parser.add_argument('--c_out', type=int, default=7, help='output size')
-    parser.add_argument('--d_model', type=int, default=512, help='dimension of model')
-    parser.add_argument('--n_heads', type=int, default=8, help='num of heads')
-    parser.add_argument('--e_layers', type=int, default=2, help='num of encoder layers')
-    parser.add_argument('--d_layers', type=int, default=1, help='num of decoder layers')
-    parser.add_argument('--d_ff', type=int, default=2048, help='dimension of fcn')
-    parser.add_argument('--moving_avg', type=int, default=25, help='window size of moving average')
-    parser.add_argument('--factor', type=int, default=1, help='attn factor')
-    parser.add_argument('--distil', action='store_false',
-                        help='whether to use distilling in encoder, using this argument means not using distilling',
-                        default=True)
-    parser.add_argument('--dropout', type=float, default=0.05, help='dropout')
-    parser.add_argument('--embed', type=str, default='timeF',
-                        help='time features encoding, options:[timeF, fixed, learned]')
-    parser.add_argument('--activation', type=str, default='gelu', help='activation')
-    parser.add_argument('--output_attention', default=False, type=bool, help='whether to output attention in ecoder')
-
-    parser.add_argument('--model-ema', action='store_true')
-    parser.add_argument('--no-model-ema', action='store_false', dest='model_ema')
-    parser.set_defaults(model_ema=True)
-    parser.add_argument('--model-ema-decay', type=float, default=0.99996, help='')
-    parser.add_argument('--model-ema-force-cpu', action='store_true', default=False, help='')
-
-    #Optimizer parameters
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--weight_decay', type=float, default=2e-5)
-    parser.add_argument('--clip-grad', type=float, default=0.02, metavar='NORM',
-                        help='Clip gradient norm (default: None, no clipping)')
-    parser.add_argument('--clip-mode', type=str, default='agc',
-                        help='Gradient clipping mode. One of ("norm", "value", "agc")')
-
-
-    parser.add_argument('--output_dir', default='./output',
-                        help='path where to save, empty for no saving')
-    parser.add_argument('--writer_output', default='./',
-                        help='path where to save SummaryWriter, empty for no saving')
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
-    parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                        help='start epoch')
-    parser.add_argument('--eval', action='store_true',
-                        help='Perform evaluation only')
-    parser.add_argument('--dist-eval', action='store_true',
-                        default=False, help='Enabling distributed evaluation')
-    parser.add_argument('--num_workers', default=0, type=int)
+                        help='时间频率(s/t/h/d/b/w/m)，51.2k数据填h即可')
+    parser.add_argument('--num_workers', default=0, type=int, help='数据加载线程数，Windows建议0，Linux可设为4或8')
     parser.add_argument('--pin-mem', action='store_true',
-                        help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
-    parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
-                        help='')
+                        help='开启页锁定内存，加速CPU到GPU的数据传输')
+    parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
+    # --- 数据集参数 (重点) ---
 
-    # Finetuning params
-    parser.add_argument('--set_ln_eval', action='store_true', default=False,
-                        help='set BN layers to eval mode during finetuning.')
+    parser.add_argument('--data', type=str, default='HH-0-3', help='数据集名称，对应 data_factory.py 里的字典键')
+    parser.add_argument('--root_path', type=str, default='/', help='这里填 / 或者留空')
+    parser.add_argument('--data_path', type=str,
 
-    # training parameters
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='number of distributed processes')
-    parser.add_argument('--local_rank', default=0, type=int)
-    parser.add_argument('--dist_url', default='env://',
-                        help='url used to set up distributed training')
-    parser.add_argument('--save_freq', default=1, type=int,
-                        help='frequency of model saving')
+                        default=r'D:\Darwin_base\My_Knowledge_Base\5_项目实践 (Projects)\Project_A_Fault_Diagnosis\data_chapter3\HH-0-3.csv',
+                        # 直接填绝对路径
+
+                        help='具体的数据文件绝对路径')
+
+    # =========================
+    # 3. 模型参数 (Model Structure)
+    # =========================
+    parser.add_argument('--model', default='DLinear', type=str, help='模型名称')
+    parser.add_argument('--seq_len', type=int, default=96, help='输入序列长度')
+    parser.add_argument('--label_len', type=int, default=48, help='Informer类模型所需的标签长度')
+    parser.add_argument('--pred_len', type=int, default=96, help='预测序列长度')
+
+    # --- DLinear 核心参数 ---
+    parser.add_argument('--individual', action='store_true', default=False,
+                        help='DLinear特有: 是否对每个通道单独建模(True)还是共享权重(False)')
+    parser.add_argument('--enc_in', type=int, default=7, help='输入通道数 (振动=1, 融合=2等)')
+
+    # --- Transformer 类通用参数 (DLinear 部分不使用，但保留以兼容代码接口) ---
+    parser.add_argument('--dec_in', type=int, default=7, help='解码器输入通道数')
+    parser.add_argument('--c_out', type=int, default=7, help='输出通道数')
+    parser.add_argument('--d_model', type=int, default=512, help='隐藏层维度')
+    parser.add_argument('--n_heads', type=int, default=8, help='多头注意力头数')
+    parser.add_argument('--e_layers', type=int, default=2, help='编码器层数')
+    parser.add_argument('--d_layers', type=int, default=1, help='解码器层数')
+    parser.add_argument('--d_ff', type=int, default=2048, help='全连接层维度')
+    parser.add_argument('--moving_avg', type=int, default=25, help='移动平均窗口大小')
+    parser.add_argument('--factor', type=int, default=1, help='注意力因子')
+    parser.add_argument('--distil', action='store_false', default=True, help='是否在编码器中使用蒸馏')
+    parser.add_argument('--dropout', type=float, default=0.05, help='Dropout比率')
+    parser.add_argument('--embed', type=str, default='timeF', help='时间编码方式')
+    parser.add_argument('--activation', type=str, default='gelu', help='激活函数')
+    parser.add_argument('--output_attention', action='store_true', help='是否输出注意力权重')
+    parser.add_argument('--embed_type', type=int, default=0, help='嵌入类型')
+
+    # =========================
+    # 4. 优化与正则化 (Optimization & EMA)
+    # =========================
+    parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
+
+    # --- 梯度裁剪 (防止梯度爆炸) ---
+    parser.add_argument('--clip-grad', type=float, default=None, metavar='NORM',
+                        help='梯度裁剪范数 (默认None，推荐 0.5-5.0)')
+    parser.add_argument('--clip-mode', type=str, default='norm',
+                        help='梯度裁剪模式: "norm", "value", "agc"')
+
+    # --- EMA (指数移动平均，提升模型鲁棒性) ---
+    parser.add_argument('--model-ema', action='store_true', help='开启 EMA')
+    parser.add_argument('--no-model-ema', action='store_false', dest='model_ema')
+    parser.set_defaults(model_ema=False)  # 默认关闭，如果需要更稳健的结果可以开启
+    parser.add_argument('--model-ema-decay', type=float, default=0.9999, help='EMA 衰减率')
+    parser.add_argument('--model-ema-force-cpu', action='store_true', default=False, help='强制在CPU上更新EMA')
+
+    # =========================
+    # 5. 系统与IO (System & IO)
+    # =========================
+    parser.add_argument('--output_dir', default='./output', help='模型保存路径')
+    parser.add_argument('--writer_output', default='./runs', help='Tensorboard日志路径')
+    parser.add_argument('--device', default='cuda', help='设备 (cuda/cpu)')
+    parser.add_argument('--seed', default=0, type=int, help='随机种子')
+    parser.add_argument('--save_freq', default=1, type=int, help='每隔多少个epoch保存一次模型')
+
+    # --- 断点续训 (Resume) ---
+    parser.add_argument('--resume', default='', help='检查点路径 (例如: output/checkpoint.pth)，用于恢复训练')
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='手动设置开始的epoch')
+
+    # --- 评估模式 ---
+    parser.add_argument('--eval', action='store_true', help='仅执行评估，不训练')
+    parser.add_argument('--train_only', action='store_true', help='仅在完整数据上训练，不验证不测试')
+    parser.add_argument('--set_ln_eval', action='store_true', default=False, help='微调时将BN层设为eval模式')
+
+    # =========================
+    # 6. 分布式训练 (Distributed - 单卡可忽略)
+    # =========================
+    parser.add_argument('--world_size', default=1, type=int, help='分布式进程数')
+    parser.add_argument('--local_rank', default=0, type=int, help='本地GPU编号')
+    parser.add_argument('--dist_url', default='env://', help='分布式初始化URL')
+    parser.add_argument('--dist-eval', action='store_true', default=False, help='开启分布式评估')
+
     return parser
-
-
-
 
 def main(args):
     print(args)
+    # 初始化分布式环境 (单卡会自动跳过)
     utils.init_distributed_mode(args)
-
-    if args.local_rank == 0:
-        writer = SummaryWriter(os.path.join(args.writer_output, 'runs'))
 
     device = torch.device(args.device)
 
-    # fix the seed for reproducibility
+    # --- 1. 设置随机种子 (重要：写论文必须固定种子) ---
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
-    # random.seed(seed)
 
+    # --- 2. 构建数据集 ---
+    # build_dataset 会去调用 mydataset.py 里的逻辑
+    # flag='train' 表示加载训练集 (通常只包含正常数据)
     dataset_train, _ = build_dataset(args=args, flag='train')
     dataset_val, _ = build_dataset(args=args, flag='val')
 
-    if args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()
-        if args.dist_eval:
-            if len(dataset_val) % num_tasks != 0:
-                print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                      'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                      'equal num of samples per-process.')
-            sampler_val = torch.utils.data.DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-        else:
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-    else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    # 创建采样器 (Sampler) 和 数据加载器 (DataLoader)
+    # DataLoader 负责把数据打包成 Batch
+    sampler_train = torch.utils.data.RandomSampler(dataset_train)
+    sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
-        drop_last=True,
+        drop_last=True, # 丢弃最后不足一个batch的数据
     )
-
 
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
@@ -194,178 +189,135 @@ def main(args):
         drop_last=False
     )
 
-
-    assert args.model in ['DLinear', 'Informer', 'Reformer', 'FEDFormer', 'Transformer', 'Autoformer', 'NLinear', 'Linear'], 'You must choose a right model'
-
+    # --- 3. 初始化模型 ---
     print(f"Creating model: {args.model}")
-
     if args.model == 'DLinear':
+        # DLinear 初始化，传入序列长度、预测长度、是否独立通道、通道数
         model = DLinear(args.seq_len, args.pred_len, args.individual, args.enc_in)
-    elif args.model == 'Informer':
-        model = Informer(args)
-    elif args.model == 'Transformer':
-        model = Transformer(args)
-    elif args.model == 'AutoFormer':
-        model = AutoFormer(args)
-    elif args.model == 'Reformer':
-        model = Reformer(args)
-    elif args.model == 'FEDformer':
-        model = FEDFormer(args)
-    elif args.model == 'NLinear':
-        model = NLinear(args)
-    elif args.model == 'Linear':
-        model = Linear(args)
     else:
+        # 你的论文主要用 DLinear，这里为了兼容代码可以保留，但建议直接用上面的
         model = DLinear(args.seq_len, args.pred_len, args.individual, args.enc_in)
 
     model.to(device)
 
-    model_ema = None
-    if args.model_ema:
-        # Important to create EMA model after cuda(), DP wrapper, and AMP but
-        # before SyncBN and DDP wrapper
-        model_ema = ModelEma(
-            model,
-            decay=args.model_ema_decay,
-            device='cpu' if args.model_ema_force_cpu else '',
-            resume='')
-
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu])
-        model_without_ddp = model.module
-
+    # 计算模型参数量，写论文时可以用来证明模型很轻量
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
-    linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
-    # args.lr = linear_scaled_lr
-    #
-    # print('*****************')
-    # print('Initial LR is ', linear_scaled_lr)
-    # print('*****************')
+    # --- 4. 定义优化器和损失函数 ---
+    optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay)
 
-    optimizer = torch.optim.AdamW(model_without_ddp.parameters(), args.lr, weight_decay=args.weight_decay)
+    # 学习率调度器 (Warmup + Cosine Decay)
+    lr_scheduler = create_lr_scheduler(optimizer, num_step=len(data_loader_train), epochs=args.epochs, warmup=True)
 
-    loss_scaler = NativeScaler()
-    lr_scheduler = create_lr_scheduler(optimizer,
-                                       num_step=len(data_loader_train),
-                                       epochs=args.epochs,
-                                       warmup=True,
-                                       warmup_epochs=1,
-                                       warmup_factor=1e-3)
-
-
-    # criterion = torch.nn.MSELoss()
     print(f'Create loss calculation: {args.loss_type}')
-    criterion = loss_family[args.loss_type]
+    criterion = loss_family[args.loss_type] # 获取损失函数 (通常是 MSELoss)
     best_loss = 100.0
 
-    output_dir = Path(args.output_dir)
-    if args.output_dir and utils.is_main_process():
-        with (output_dir / "model.txt").open("a") as f:
-            f.write(str(model))
-    if args.output_dir and utils.is_main_process():
-        with (output_dir / "args.txt").open("a") as f:
-            f.write(json.dumps(args.__dict__, indent=2) + "\n")
-    if args.resume or os.path.exists(f'{args.output_dir}/{args.model}_sl{args.seq_len}_pl{args.pred_len}_ll{args.label_len}_et{args.embed_type}_dm{args.d_model}_best_checkpoint.pth'):
-        args.resume = f'{args.output_dir}/{args.model}_sl{args.seq_len}_pl{args.pred_len}_ll{args.label_len}_et{args.embed_type}_dm{args.d_model}_best_checkpoint.pth'
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            print("Loading local checkpoint at {}".format(args.resume))
-            checkpoint = torch.load(args.resume, map_location='cpu')
-        msg = model_without_ddp.load_state_dict(checkpoint['model'])
-        print(msg)
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for state in optimizer.state.values():  # load parameters to cuda
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.cuda()
-
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            best_loss = checkpoint['best_score']
-            print(f'Now best_loss is {best_loss}')
-            args.start_epoch = checkpoint['epoch'] + 1
-            if args.model_ema:
-                utils._load_checkpoint_for_ema(
-                    model_ema, checkpoint['model_ema'])
-            if 'scaler' in checkpoint:
-                loss_scaler.load_state_dict(checkpoint['scaler'])
-
-    if args.eval:
-        # util.replace_batchnorm(model) # Users may choose whether to merge Conv-BN layers during eval
-        print(f"Evaluating model: {args.model}")
-        print(f'No Visualization')
-        test_stats = evaluate(data_loader_val, model, criterion, device, None, None, args, visualization=False)
-        print(
-            f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%"
-        )
-
+    # --- 5. 开始训练循环 ---
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
 
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-
+        # A. 训练阶段
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, args.clip_mode, model_ema,
-            # set_training_mode=args.finetune == ''  # keep in eval mode during finetuning
-            set_training_mode=True,
-            set_ln_eval=args.set_ln_eval,  # set bn to eval if finetune
-            writer=writer,
-            lr_scheduler=lr_scheduler,
-            args=args
+            optimizer, device, epoch, loss_scaler=None,
+            max_norm=args.clip_grad, model_ema=None,
+            set_training_mode=True, writer=None,
+            lr_scheduler=lr_scheduler, args=args
         )
 
-        test_stats = evaluate(data_loader_val, model, criterion, device, epoch, writer, args, visualization=True)
+        # B. 验证阶段
+        test_stats = evaluate(data_loader_val, model, criterion, device, epoch, None, args, visualization=False)
         print(f"Loss of the network on the {len(dataset_val)} test text-data: {test_stats['valid_loss']:.4f}")
 
+        # C. 保存最佳模型
         if test_stats["valid_loss"] < best_loss:
             best_loss = test_stats["valid_loss"]
             if args.output_dir:
-                ckpt_path = os.path.join(output_dir, f'{args.model}_sl{args.seq_len}_pl{args.pred_len}_ll{args.label_len}_et{args.embed_type}_dm{args.d_model}_best_checkpoint.pth')
-                checkpoint_paths = [ckpt_path]
-                print("Saving checkpoint to {}".format(ckpt_path))
-                for checkpoint_path in checkpoint_paths:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'best_score': best_loss,
-                        'model_ema': get_state_dict(model_ema),
-                        'scaler': loss_scaler.state_dict(),
-                        'args': args,
-                    }, checkpoint_path)
+                # 拼接保存路径
+                ckpt_path = os.path.join(args.output_dir, f'{args.model}_best.pth')
+                print(f"Saving best checkpoint to {ckpt_path}")
+                utils.save_on_master({
+                    'model': model.state_dict(), # 只保存权重，不保存整个对象
+                    'optimizer': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'best_score': best_loss,
+                    'args': args,
+                }, ckpt_path)
 
         print(f'Min {args.loss_type} loss: {best_loss:.4f}')
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
-
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-
-        torch.cuda.empty_cache()
-
     total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print('Training time {}'.format(str(datetime.timedelta(seconds=int(total_time)))))
+
+    # =======================================================
+    # --- 6. 异常检测评估流程 (DLinear + SPE + POT) ---
+    # =======================================================
+    print("\n-------------------------------------------------------")
+    print("Starting Anomaly Detection Evaluation (DLinear + POT)")
+
+    # 1. 实例化异常检测器
+    # q=1e-4: 风险系数，控制阈值的严格程度
+    # level=0.98: POT 算法用于拟合长尾分布的初始分位点
+    detector = AnomalyMeasurer(q=1e-4, level=0.98)
+
+    # 定义预测函数：获取模型输出和真实值
+    def get_predictions(dataloader, model):
+        model.eval() # 开启评估模式，关闭 Dropout 等
+        preds_list = []
+        trues_list = []
+
+        with torch.no_grad(): # 不计算梯度，省显存
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(dataloader):
+                batch_x = batch_x.float().to(device)
+                batch_y = batch_y.float().to(device) # 真实未来数据
+
+                # DLinear 前向传播，得到预测值
+                outputs = model(batch_x)
+
+                # 对齐维度，只取最后 pred_len 长度进行比较
+                f_dim = -1 if args.features == 'MS' else 0
+                outputs = outputs[:, -args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -args.pred_len:, f_dim:]
+
+                preds_list.append(outputs.detach().cpu())
+                trues_list.append(batch_y.detach().cpu())
+
+        return torch.cat(preds_list, dim=0).numpy(), torch.cat(trues_list, dim=0).numpy()
+
+    # 2. 计算验证集 (正常数据) 的 SPE
+    print("Calculating SPE on Validation Set (Normal Baseline)...")
+    val_preds, val_trues = get_predictions(data_loader_val, model)
+    # 计算均方预测误差 (Squared Prediction Error)
+    val_spe = detector.calculate_spe(torch.tensor(val_preds), torch.tensor(val_trues))
+
+    # 3. 拟合 POT 阈值 (核心步骤)
+    # 根据验证集的误差分布，自动生成一个“红线”阈值
+    dynamic_threshold = detector.fit_pot(val_spe)
+
+    # 4. 在测试集 (包含故障) 上进行检测
+    dataset_test, _ = build_dataset(args=args, flag='test')
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, batch_size=args.batch_size, shuffle=False, drop_last=False)
+
+    print("Calculating SPE on Test Set...")
+    test_preds, test_trues = get_predictions(data_loader_test, model)
+    test_spe = detector.calculate_spe(torch.tensor(test_preds), torch.tensor(test_trues))
+
+    # 5. 生成最终的 0/1 标签
+    pred_labels, _ = detector.detect(test_spe)
+
+    print(f"Test Set Anomaly Count: {np.sum(pred_labels)} / {len(pred_labels)}")
+
+    # 保存结果供论文绘图
+    np.save(os.path.join(args.output_dir, 'test_spe.npy'), test_spe)
+    print("-------------------------------------------------------")
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('TimeSeriesModelSoups training and evaluation script', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('DLinear Training', parents=[get_args_parser()])
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
