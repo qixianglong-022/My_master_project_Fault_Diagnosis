@@ -7,7 +7,7 @@ data_dict = {
     'ETTm2': Dataset_ETT_minute,
     'custom': Dataset_Custom,
     #
-    'HH-0-3': Dataset_ETT_hour,
+    'HH-0-3': Dataset_ETT_minute,
 }
 
 

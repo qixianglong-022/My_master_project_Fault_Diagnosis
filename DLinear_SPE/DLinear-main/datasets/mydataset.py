@@ -191,9 +191,11 @@ class Dataset_ETT_minute(Dataset):
 
 
 class Dataset_Custom(Dataset):
+    # 1. 修改 __init__，增加 scaler 参数，默认为 None
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, timeenc=0, freq='h', train_only=False):
+                 target='OT', scale=True, timeenc=0, freq='h', train_only=False,
+                 scaler=None):  # <--- 新增这个参数
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -205,8 +207,9 @@ class Dataset_Custom(Dataset):
             self.label_len = size[1]
             self.pred_len = size[2]
         # init
-        assert flag in ['train', 'test', 'val']
-        type_map = {'train': 0, 'val': 1, 'test': 2}
+        assert flag in ['train', 'test', 'val', 'all']
+        # type_map = {'train': 0, 'val': 1, 'test': 2}
+        type_map = {'train': 0, 'val': 1, 'test': 2, 'all': 99}
         self.set_type = type_map[flag]
 
         self.features = features
@@ -215,13 +218,13 @@ class Dataset_Custom(Dataset):
         self.timeenc = timeenc
         self.freq = freq
         self.train_only = train_only
+        self.scaler = scaler
 
         self.root_path = root_path
         self.data_path = data_path
         self.__read_data__()
 
     def __read_data__(self):
-        self.scaler = StandardScaler()
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
 
@@ -233,13 +236,29 @@ class Dataset_Custom(Dataset):
             cols.remove(self.target)
         cols.remove('date')
         # print(cols)
+        # num_train = int(len(df_raw) * (0.7 if not self.train_only else 1))
+        # num_test = int(len(df_raw) * 0.2)
+        # num_vali = len(df_raw) - num_train - num_test
+        # border1s = [0, num_train - self.seq_len, len(df_raw) - num_test - self.seq_len]
+        # border2s = [num_train, num_train + num_vali, len(df_raw)]
+        # border1 = border1s[self.set_type]
+        # border2 = border2s[self.set_type]
         num_train = int(len(df_raw) * (0.7 if not self.train_only else 1))
         num_test = int(len(df_raw) * 0.2)
         num_vali = len(df_raw) - num_train - num_test
+
+        # 定义切分边界
         border1s = [0, num_train - self.seq_len, len(df_raw) - num_test - self.seq_len]
         border2s = [num_train, num_train + num_vali, len(df_raw)]
-        border1 = border1s[self.set_type]
-        border2 = border2s[self.set_type]
+
+        # ============== 新增逻辑 ==============
+        if self.set_type == 99:  # 99 代表读取全部数据
+            border1 = 0
+            border2 = len(df_raw)
+        else:
+            border1 = border1s[self.set_type]
+            border2 = border2s[self.set_type]
+
 
         if self.features == 'M' or self.features == 'MS':
             df_raw = df_raw[['date'] + cols]
@@ -250,11 +269,20 @@ class Dataset_Custom(Dataset):
             df_data = df_raw[[self.target]]
 
         if self.scale:
-            train_data = df_data[border1s[0]:border2s[0]]
-            self.scaler.fit(train_data.values)
-            # print(self.scaler.mean_)
-            # exit()
+            # ================= 修改开始 =================
+            if self.scaler is None:
+                # 如果没有传入 scaler，说明是训练阶段，我们需要创建一个新的并 fit
+                self.scaler = StandardScaler()
+                train_data = df_data[border1s[0]:border2s[0]]  # 只用训练集 fit
+                self.scaler.fit(train_data.values)
+                print("Scaler is fitted on TRAIN data.")
+            else:
+                # 如果传入了 scaler，直接用，千万不要 re-fit！
+                print("Loading pre-fitted Scaler from external...")
+
+            # 使用 scaler 进行转换
             data = self.scaler.transform(df_data.values)
+            # ================= 修改结束 =================
         else:
             data = df_data.values
 
@@ -265,7 +293,9 @@ class Dataset_Custom(Dataset):
             df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
             df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
             df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
-            data_stamp = df_stamp.drop(['date'], 1).values
+            # data_stamp = df_stamp.drop(['date'], 1).values
+            # 改为:
+            data_stamp = df_stamp.drop(['date'], axis=1).values
         elif self.timeenc == 1:
             data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
             data_stamp = data_stamp.transpose(1, 0)

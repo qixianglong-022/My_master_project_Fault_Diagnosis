@@ -16,6 +16,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 import json
 import os
+import joblib
 from pathlib import Path
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 from util.anomaly_utils import AnomalyMeasurer  # [核心工具] 引入我们写的异常检测工具类
@@ -51,8 +52,9 @@ def get_args_parser():
     # parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='数据文件名')
     parser.add_argument('--features', type=str, default='S',
                         help='预测任务: [M]多变量预测多变量, [S]单变量预测单变量, [MS]多变量预测单变量')
+    # 改1
     parser.add_argument('--target', type=str, default='Motor_Vibration', help='目标列名(S或MS任务用)')
-    parser.add_argument('--freq', type=str, default='h',
+    parser.add_argument('--freq', type=str, default='m',
                         help='时间频率(s/t/h/d/b/w/m)，51.2k数据填h即可')
     parser.add_argument('--num_workers', default=0, type=int, help='数据加载线程数，Windows建议0，Linux可设为4或8')
     parser.add_argument('--pin-mem', action='store_true',
@@ -61,14 +63,13 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
     # --- 数据集参数 (重点) ---
 
+    #改2
     parser.add_argument('--data', type=str, default='HH-0-3', help='数据集名称，对应 data_factory.py 里的字典键')
     parser.add_argument('--root_path', type=str, default='/', help='这里填 / 或者留空')
     parser.add_argument('--data_path', type=str,
 
-                        default=r'D:\Darwin_base\My_Knowledge_Base\5_项目实践 (Projects)\Project_A_Fault_Diagnosis\data_chapter3\HH-0-3.csv',
+                        default=r'D:\Darwin_base\My_Knowledge_Base\5_项目实践 (Projects)\Project_A_Fault_Diagnosis\data_chapter3\HH-0-3_Motor_Vibration_train.csv',help='具体的数据文件绝对路径')
                         # 直接填绝对路径
-
-                        help='具体的数据文件绝对路径')
 
     # =========================
     # 3. 模型参数 (Model Structure)
@@ -122,7 +123,8 @@ def get_args_parser():
     # =========================
     # 5. 系统与IO (System & IO)
     # =========================
-    parser.add_argument('--output_dir', default='./output', help='模型保存路径')
+    # 改3
+    parser.add_argument('--output_dir', default='./output_Motor_Vibration', help='模型保存路径')
     parser.add_argument('--writer_output', default='./runs', help='Tensorboard日志路径')
     parser.add_argument('--device', default='cuda', help='设备 (cuda/cpu)')
     parser.add_argument('--seed', default=0, type=int, help='随机种子')
@@ -163,6 +165,16 @@ def main(args):
     # build_dataset 会去调用 mydataset.py 里的逻辑
     # flag='train' 表示加载训练集 (通常只包含正常数据)
     dataset_train, _ = build_dataset(args=args, flag='train')
+    # ================= 新增保存逻辑 =================
+    # 确保输出目录存在
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    scaler_path = os.path.join(args.output_dir, 'scaler.pkl')
+    print(f"Saving scaler to {scaler_path} ...")
+    # 从 dataset_train 中提取出刚刚 fit 好的 scaler 并保存
+    joblib.dump(dataset_train.scaler, scaler_path)
+    # ===============================================
     dataset_val, _ = build_dataset(args=args, flag='val')
 
     # 创建采样器 (Sampler) 和 数据加载器 (DataLoader)
@@ -261,7 +273,7 @@ def main(args):
 
     # 1. 实例化异常检测器
     # q=1e-4 意味着我们对正常数据的容忍度很高，只有极值才算异常
-    detector = AnomalyMeasurer(q=1e-6, level=0.98)
+    detector = AnomalyMeasurer(q=1e-5, level=0.98)
 
     # 2. 准备数据：我们需要获取模型在 验证集 和 测试集 上的预测结果
     # 定义一个辅助函数来获取预测值和真实值
