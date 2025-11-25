@@ -30,9 +30,6 @@ from util.lr_sched import create_lr_scheduler
 from datasets import build_dataset
 from models import DLinear  # 我们主要关注 DLinear
 
-# 其他模型虽然引入了，但在你的论文中如果不用，可以后续清理掉
-from models import Informer, Reformer, FEDFormer, Transformer, AutoFormer, NLinear, Linear
-
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DLinear Training and Evaluation Script', add_help=False)
@@ -52,9 +49,9 @@ def get_args_parser():
     # parser.add_argument('--data', type=str, default='custom', help='数据集类型')
     # parser.add_argument('--root_path', type=str, default='./TimeseriesData', help='数据根目录')
     # parser.add_argument('--data_path', type=str, default='ETTh1.csv', help='数据文件名')
-    parser.add_argument('--features', type=str, default='M',
+    parser.add_argument('--features', type=str, default='S',
                         help='预测任务: [M]多变量预测多变量, [S]单变量预测单变量, [MS]多变量预测单变量')
-    parser.add_argument('--target', type=str, default='OT', help='目标列名(S或MS任务用)')
+    parser.add_argument('--target', type=str, default='Motor_Vibration', help='目标列名(S或MS任务用)')
     parser.add_argument('--freq', type=str, default='h',
                         help='时间频率(s/t/h/d/b/w/m)，51.2k数据填h即可')
     parser.add_argument('--num_workers', default=0, type=int, help='数据加载线程数，Windows建议0，Linux可设为4或8')
@@ -84,7 +81,7 @@ def get_args_parser():
     # --- DLinear 核心参数 ---
     parser.add_argument('--individual', action='store_true', default=False,
                         help='DLinear特有: 是否对每个通道单独建模(True)还是共享权重(False)')
-    parser.add_argument('--enc_in', type=int, default=7, help='输入通道数 (振动=1, 融合=2等)')
+    parser.add_argument('--enc_in', type=int, default=1, help='输入通道数 (振动=1, 融合=2等)')
 
     # --- Transformer 类通用参数 (DLinear 部分不使用，但保留以兼容代码接口) ---
     parser.add_argument('--dec_in', type=int, default=7, help='解码器输入通道数')
@@ -223,7 +220,8 @@ def main(args):
         train_stats = train_one_epoch(
             model, criterion, data_loader_train,
             optimizer, device, epoch, loss_scaler=None,
-            max_norm=args.clip_grad, model_ema=None,
+            # clip_mode=args.clip_grad,
+            model_ema=None,
             set_training_mode=True, writer=None,
             lr_scheduler=lr_scheduler, args=args
         )
@@ -255,29 +253,40 @@ def main(args):
     # =======================================================
     # --- 6. 异常检测评估流程 (DLinear + SPE + POT) ---
     # =======================================================
+    # =======================================================
+    # 新增：基于 DLinear + SPE + POT 的异常检测流程
+    # =======================================================
     print("\n-------------------------------------------------------")
     print("Starting Anomaly Detection Evaluation (DLinear + POT)")
 
     # 1. 实例化异常检测器
-    # q=1e-4: 风险系数，控制阈值的严格程度
-    # level=0.98: POT 算法用于拟合长尾分布的初始分位点
-    detector = AnomalyMeasurer(q=1e-4, level=0.98)
+    # q=1e-4 意味着我们对正常数据的容忍度很高，只有极值才算异常
+    detector = AnomalyMeasurer(q=1e-6, level=0.98)
 
-    # 定义预测函数：获取模型输出和真实值
+    # 2. 准备数据：我们需要获取模型在 验证集 和 测试集 上的预测结果
+    # 定义一个辅助函数来获取预测值和真实值
     def get_predictions(dataloader, model):
-        model.eval() # 开启评估模式，关闭 Dropout 等
+        model.eval()
         preds_list = []
         trues_list = []
 
-        with torch.no_grad(): # 不计算梯度，省显存
+        with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(dataloader):
                 batch_x = batch_x.float().to(device)
-                batch_y = batch_y.float().to(device) # 真实未来数据
+                batch_y = batch_y.float().to(device)
 
-                # DLinear 前向传播，得到预测值
-                outputs = model(batch_x)
+                # DLinear 的 forward 逻辑
+                # 注意：如果是异常检测，通常是用“预测未来”或“重构当前”的误差
+                # 这里假设你沿用 forecasting 任务，比较 forecast vs ground_truth
+                if args.model == 'DLinear':
+                    outputs = model(batch_x)
+                else:
+                    # 兼容其他模型接口
+                    dec_inp = torch.zeros_like(batch_y[:, -args.pred_len:, :]).float()
+                    dec_inp = torch.cat([batch_y[:, :args.label_len, :], dec_inp], dim=1).float().to(device)
+                    outputs = model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                # 对齐维度，只取最后 pred_len 长度进行比较
+                # DLinear 输出通常不需要 f_dim 切片，但为了保险起见对齐维度
                 f_dim = -1 if args.features == 'MS' else 0
                 outputs = outputs[:, -args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -args.pred_len:, f_dim:]
@@ -285,36 +294,54 @@ def main(args):
                 preds_list.append(outputs.detach().cpu())
                 trues_list.append(batch_y.detach().cpu())
 
-        return torch.cat(preds_list, dim=0).numpy(), torch.cat(trues_list, dim=0).numpy()
+        preds = torch.cat(preds_list, dim=0).numpy()
+        trues = torch.cat(trues_list, dim=0).numpy()
+        return preds, trues
 
-    # 2. 计算验证集 (正常数据) 的 SPE
+    # 3. 获取验证集数据（通常作为“正常数据”的参考来计算阈值）
+    # 注意：确保你的验证集里主要包含正常样本，或者脏数据比例极低
     print("Calculating SPE on Validation Set (Normal Baseline)...")
     val_preds, val_trues = get_predictions(data_loader_val, model)
-    # 计算均方预测误差 (Squared Prediction Error)
     val_spe = detector.calculate_spe(torch.tensor(val_preds), torch.tensor(val_trues))
 
-    # 3. 拟合 POT 阈值 (核心步骤)
-    # 根据验证集的误差分布，自动生成一个“红线”阈值
+    # 4. 拟合 POT 阈值
+    # 这步是关键：根据 DLinear 对正常数据的拟合误差分布，自动画出“红线”
     dynamic_threshold = detector.fit_pot(val_spe)
 
-    # 4. 在测试集 (包含故障) 上进行检测
+    # 5. 在测试集上进行检测
+    # 假设 data_loader_test 已经存在 (你代码里可能需要 build_dataset 这里的 flag='test')
     dataset_test, _ = build_dataset(args=args, flag='test')
     data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=args.batch_size, shuffle=False, drop_last=False)
+        dataset_test, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, drop_last=False)
 
     print("Calculating SPE on Test Set...")
     test_preds, test_trues = get_predictions(data_loader_test, model)
     test_spe = detector.calculate_spe(torch.tensor(test_preds), torch.tensor(test_trues))
 
-    # 5. 生成最终的 0/1 标签
+    # 6. 生成检测结果 (0: 正常, 1: 异常)
+    # 在 detect 之前对 spe_scores 进行平滑
+    test_spe = smooth(test_spe, window_len=10)  # 窗口越大越平滑，抗干扰越强
     pred_labels, _ = detector.detect(test_spe)
 
+    # 7. 保存或打印结果
     print(f"Test Set Anomaly Count: {np.sum(pred_labels)} / {len(pred_labels)}")
 
-    # 保存结果供论文绘图
+    # 如果你有测试集的真实异常标签 (ground truth labels)，可以在这里计算 Precision/Recall/F1
+    # 示例：
+    # from sklearn.metrics import classification_report
+    # print(classification_report(test_ground_truth_labels, pred_labels))
+
+    # 保存 SPE 结果用于论文画图 (重要！)
     np.save(os.path.join(args.output_dir, 'test_spe.npy'), test_spe)
+    np.save(os.path.join(args.output_dir, 'test_threshold.npy'), dynamic_threshold)
     print("-------------------------------------------------------")
 
+# 在 detect 之前对 spe_scores 进行平滑
+def smooth(x, window_len=5):
+    s = np.r_[x[window_len-1:0:-1], x, x[-1:-window_len:-1]]
+    w = np.ones(window_len,'d')
+    y = np.convolve(w/w.sum(), s, mode='valid')
+    return y[(window_len//2):-(window_len//2)]
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DLinear Training', parents=[get_args_parser()])

@@ -76,8 +76,18 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.MSELoss,
         # this attribute is added by timm on one optimizer (adahessian)
         is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
         with torch.cuda.amp.autocast():
-            loss_scaler(loss, optimizer, clip_grad=clip_grad, clip_mode=clip_mode,
-                        parameters=model.parameters(), create_graph=is_second_order)
+            #loss_scaler(loss, optimizer, clip_grad=clip_grad, clip_mode=clip_mode,
+            #            parameters=model.parameters(), create_graph=is_second_order)
+            # --- 修改开始 ---
+            if loss_scaler is not None:
+                loss_scaler(loss, optimizer, clip_grad=clip_grad, parameters=model.parameters())
+            else:
+                # 如果没有 scaler，使用标准反向传播
+                loss.backward()
+                if clip_grad is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                optimizer.step()
+            # --- 修改结束 ---
 
         torch.cuda.synchronize()
         if model_ema is not None:
@@ -91,9 +101,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.MSELoss,
         if idx % print_freq == 0:
             if args.local_rank == 0:
                 iter_all_count = epoch * num_steps + idx
-                writer.add_scalar('train_loss', loss, iter_all_count)
-                # writer.add_scalar('grad_norm', grad_norm, iter_all_count)
-                writer.add_scalar('lr', learning_rate, iter_all_count)
+                if writer is not None:
+                    writer.add_scalar('train_loss', loss, iter_all_count)
+                    # writer.add_scalar('grad_norm', grad_norm, iter_all_count)
+                    writer.add_scalar('lr', learning_rate, iter_all_count)
 
         lr_scheduler.step()
     # gather the stats from all processes
@@ -144,7 +155,8 @@ def evaluate(data_loader, model, criterion, device, epoch, writer, args, visuali
 
 
     if visualization and args.local_rank == 0:
-        writer.add_scalar('valid_loss', loss.item(), epoch)
+        if writer is not None:
+            writer.add_scalar('valid_loss', loss.item(), epoch)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

@@ -65,6 +65,7 @@ class AnomalyMeasurer:
         else:
             self.threshold = threshold_init + (scale / c) * (((self.q * n / Nt) ** (-c)) - 1)
 
+        self.threshold = self.threshold * 1.2  # 强制提高 20% 的余量
         print(f"[POT Auto-Threshold] Initial Th: {threshold_init:.4f}, Final Dynamic Th: {self.threshold:.4f}")
         return self.threshold
 

@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timedelta  # 引入时间处理模块
 
 
-def txt_to_csv_with_fake_time(input_path, output_path, time_limit=12.8):
+def txt_to_csv_with_fake_time(input_path, output_path, time_limit=25.6):
     # 定义列索引
     INDEX_TIME_ORIGINAL = 0  # 原始txt中的时间列（仅用于判断何时停止）
     INDEX_VIBRATION = 8  # 电机振动列
