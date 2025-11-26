@@ -80,7 +80,7 @@ class DLinear(nn.Module):
         self.pred_len = pred_len
 
         # 使用固定大小的卷积核进行序列分解
-        kernel_size = 25
+        kernel_size = 301  # 原来是25
         self.decompsition = series_decomp(kernel_size)
         self.individual = individual
         self.channels = enc_in

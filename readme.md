@@ -36,8 +36,8 @@
     
 * **测试集生成（Test Set）：**
     * **来源：** 手动`HH-0-3_Motor_Vibration_train.csv`和`BF-0-3_Motor_Vibration_train.csv`拼接文件（例如 `Mixed_HH_FB_0-3_Motor_Vibration_test.csv`）。
-    * **结构：** `[ 一段正常数据 | 一段故障数据 ]`。
-    * **标签：** 配套生成的 `.npy` 标签文件，正常段标记为 0，故障段标记为 1。
+    * **结构：** `[ 一段正常数据50% | 一段故障数据50% ]`。
+    * **标签：** 配套生成的 `Mixed_HH_FB_0-3_Motor_Vibration_test.npy` 标签文件，正常段标记为 0，故障段标记为 1。
     * **关键点：** **必须复用训练集的 Scaler** 进行标准化，严禁在测试集上重新计算均值方差，以防故障特征被抹除。
 
 ---
@@ -51,12 +51,12 @@
     * **模型：** DLinear (分解为趋势项 + 季节项)。
     * **任务：** 时序预测（用过去 96 个点预测未来 96 个点）。
     * **Loss：** MSE（均方误差），迫使模型极度适应正常波形。
-    * **产出 1：** 最佳模型权重 (`checkpoint.pth`)。
+    * **产出 1：** 最佳模型权重 (`DLinear_best.pth`)。
     * **产出 2：** 数据标准化器 (`scaler.pkl`)。
 3.  **阈值标定 (Threshold Calibration)：**
     * 使用验证集（Validation Set）跑一遍模型。
-    * 计算验证集的 SPE（预测误差）。
-    * **POT 算法：** 利用极值理论分析 SPE 的尾部分布，在给定风险概率 `q` 下自动计算出 **动态阈值 (`test_threshold.npy`)**。
+    * 计算验证集的 SPE（预测误差）。`test_spe_Motot_Vibration.npy`
+    * **POT 算法：** 利用极值理论分析 SPE 的尾部分布，在给定风险概率 `q` 下自动计算出 **动态阈值 (`test_threshold_Motot_Vibration.npy`)**。
 
 ---
 
@@ -65,9 +65,9 @@
 **核心思想：** 用“正常”的标准去衡量一切，误差大的就是“异常”。
 
 1.  **加载资产：**
-    * 加载模型权重 (`checkpoint.pth`)。
+    * 加载模型权重 (`DLinear_best.pth`)。
     * 加载**训练时的** Scaler (`scaler.pkl`)。
-    * 加载**训练时的** 阈值 (`test_threshold.npy`)。
+    * 加载**训练时的** 阈值 (`test_threshold_Motot_Vibration.npy`)。
 2.  **全量推理：**
     * 读取混合测试集（`flag='all'` 模式）。
     * DLinear 进行预测，得到预测值。
@@ -80,6 +80,7 @@
     * 与真实标签 (`gt_labels`) 对比。
     * 计算 Accuracy, Precision (查准), Recall (查全), F1-Score。
     * 生成混淆矩阵。
+    * 生成`final_inference_labels_Moter_Vibration.npy`和`final_inference_spe_Moter_Vibration.npy`。
 
 ---
 

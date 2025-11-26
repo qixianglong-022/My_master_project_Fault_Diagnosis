@@ -38,9 +38,9 @@ def get_args_parser():
     # =========================
     # 1. 基础训练参数 (Basic Training)
     # =========================
-    parser.add_argument('--batch_size', default=32, type=int, help='批大小')
+    parser.add_argument('--batch_size', default=128, type=int, help='批大小')
     parser.add_argument('--epochs', default=10, type=int, help='训练轮数')
-    parser.add_argument('--loss_type', default='MSE', type=str,
+    parser.add_argument('--loss_type', default='MAE', type=str,
                         choices=['MAE', 'MSE', 'RMSE', 'MAPE', 'MSPE', 'RSE', 'CORR'],
                         help='损失函数类型，推荐 MSE')
 
@@ -75,12 +75,12 @@ def get_args_parser():
     # 3. 模型参数 (Model Structure)
     # =========================
     parser.add_argument('--model', default='DLinear', type=str, help='模型名称')
-    parser.add_argument('--seq_len', type=int, default=96, help='输入序列长度')
+    parser.add_argument('--seq_len', type=int, default=1024, help='输入序列长度') # 锁死输入序列长度
     parser.add_argument('--label_len', type=int, default=48, help='Informer类模型所需的标签长度')
-    parser.add_argument('--pred_len', type=int, default=96, help='预测序列长度')
+    parser.add_argument('--pred_len', type=int, default=1, help='预测序列长度') # 锁死预测序列长度
 
     # --- DLinear 核心参数 ---
-    parser.add_argument('--individual', action='store_true', default=False,
+    parser.add_argument('--individual', action='store_true', default=True,
                         help='DLinear特有: 是否对每个通道单独建模(True)还是共享权重(False)')
     parser.add_argument('--enc_in', type=int, default=1, help='输入通道数 (振动=1, 融合=2等)')
 

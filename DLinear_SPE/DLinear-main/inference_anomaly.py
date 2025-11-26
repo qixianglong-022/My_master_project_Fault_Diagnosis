@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import pandas as pd
 import joblib
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
 
@@ -29,12 +30,12 @@ def get_args():
                         # 直接填绝对路径
                         help='具体的数据文件绝对路径')
 
-    parser.add_argument('--seq_len', type=int, default=96, help='输入长度')
-    parser.add_argument('--pred_len', type=int, default=96, help='预测长度 (训练时用的多少就填多少)')
+    parser.add_argument('--seq_len', type=int, default=1024, help='输入长度')
+    parser.add_argument('--pred_len', type=int, default=1, help='预测长度 (训练时用的多少就填多少)')
     parser.add_argument('--enc_in', type=int, default=1, help='通道数 (振动是1, 融合是2+)')
 
     # 模型相关
-    parser.add_argument('--individual', action='store_true', default=False, help='DLinear参数')
+    parser.add_argument('--individual', action='store_true', default=True, help='DLinear参数')
 
     # 路径相关 (指向你 train_gpu.py 输出的那个文件夹)
     #改2
@@ -106,7 +107,8 @@ def main():
         target='Motor_Vibration',
         timeenc=0,
         freq='m',
-        scaler = scaler
+        scaler = scaler,
+        step = 10
     )
 
     # 强制让它读取整个文件 (覆盖默认的切分逻辑)
@@ -114,7 +116,7 @@ def main():
     # 如果 Dataset_Custom 内部有根据 flag 切分的逻辑，你需要确认它读到了所有行
     print(f"Total samples to test: {len(dataset)}")
 
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=False, drop_last=False)
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=False, drop_last=False)
 
     # ================= 4. 推理 (Inference) =================
     preds_list = []
@@ -153,6 +155,9 @@ def main():
     # 获取真实标签
     try:
         gt_labels = np.load(test_data_label)
+        # 降采样
+        # downsample_step = 10
+        # gt_labels = gt_labels[::downsample_step]
         min_len = min(len(spe_scores), len(gt_labels))
         gt_labels = gt_labels[:min_len]
         spe_scores = spe_scores[:min_len]
@@ -225,6 +230,16 @@ def main():
     print(
         f"Fault  SPE -> Mean: {np.mean(fault_spe):.4f},  Median: {np.median(fault_spe):.4f},  Std: {np.std(fault_spe):.4f}")
     print("=======================")
+    # 取第 0 个样本的最后维特征（振动）
+    # preds shape: [N, 96, 1], trues shape: [N, 96, 1]
+    sample_idx = 0
+    plt.figure(figsize=(10, 5))
+    plt.plot(trues[sample_idx, :, -1], label='Ground Truth')
+    plt.plot(preds[sample_idx, :, -1], label='Prediction')
+    plt.title(f"Sample {sample_idx} Prediction vs Truth")
+    plt.legend()
+    plt.savefig(os.path.join(args.output_dir, 'debug_vis.png'))
+    print(f"Saved debug visualization to {os.path.join(args.output_dir, 'debug_vis.png')}")
 
 if __name__ == '__main__':
     main()

@@ -194,8 +194,8 @@ class Dataset_Custom(Dataset):
     # 1. 修改 __init__，增加 scaler 参数，默认为 None
     def __init__(self, root_path, flag='train', size=None,
                  features='S', data_path='ETTh1.csv',
-                 target='OT', scale=True, timeenc=0, freq='h', train_only=False,
-                 scaler=None):  # <--- 新增这个参数
+                 target='OT', scale=True, timeenc=0, freq='m', train_only=False,
+                 scaler=None, step=10):  # <--- 新增这个参数
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -222,11 +222,17 @@ class Dataset_Custom(Dataset):
 
         self.root_path = root_path
         self.data_path = data_path
+        self.step = step
         self.__read_data__()
 
     def __read_data__(self):
         df_raw = pd.read_csv(os.path.join(self.root_path,
                                           self.data_path))
+        # 在这里进行降采样！
+        # ::self.step 意味着每隔 step 行取一行
+        # 比如 51.2k 采样率，step=10，这就变成了 5.12k 采样率，波形会平滑很多
+        # df_raw = df_raw.iloc[::self.step, :].reset_index(drop=True)
+        print(f"Data downsampled by factor {self.step}. New shape: {df_raw.shape}")
 
         '''
         df_raw.columns: ['date', ...(other features), target feature]
