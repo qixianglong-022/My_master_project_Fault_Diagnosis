@@ -1,0 +1,105 @@
+# ==========================================
+# 1. Standard Python Ignores (标准Python忽略)
+# ==========================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments (非常重要，不要上传虚拟环境)
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE Settings (不同设备的IDE配置可能冲突，建议忽略)
+.idea/
+.vscode/
+*.swp
+
+# ==========================================
+# 2. Project Specific Ignores (本项目特定忽略)
+# ==========================================
+
+# --- A. 数据集与缓存 (Data & Cache) ---
+# 你的原始数据有144GB，绝对不能上传
+*.txt
+*.csv
+*.xlsx
+*.xls
+
+# 我们在 data_loader.py 中生成的加速缓存文件夹
+# 这个文件夹在树莓派上生成一次即可，不需要同步
+cache_data/
+
+# 如果你把数据集放在了项目里的特定文件夹，也忽略掉
+TimeseriesData/
+data/
+data_chapter3/
+
+# --- B. 训练产物 (Training Artifacts) ---
+# TensorBoard 日志
+runs/
+logs/
+
+# 训练生成的权重文件和目录 (体积大，且每次训练都会变)
+# 如果你需要把最佳模型传到树莓派，建议手动拷贝，或者只由 git lfs 管理（如果非要用git传）
+# 一般建议忽略，防止仓库爆炸
+checkpoints/
+output/
+output_Motor_Vibration/
+results/
+
+# 具体的权重文件格式
+*.pth
+*.pt
+*.ckpt
+*.pkl
+
+# --- C. 部署相关 (Deployment) ---
+# ONNX 模型通常也比较大，且是生成的，可以忽略
+# (当然，如果你想用git来传输这个模型到树莓派，可以把 *.onnx 前面的 # 去掉，但这会让仓库变大)
+*.onnx
+
+# 阈值文件 (虽然小，但属于生成文件，建议忽略，或者手动管理)
+# *.npy  <-- 如果你想保留阈值文件，可以注释掉这一行，但我建议忽略所有生成的 npy
+test_threshold.npy
+*_spe.npy
+*_labels.npy
+
+# --- D. 临时测试图 (Visualization) ---
+# 我们代码中生成的 debug 图片，不需要版本控制
+*.png
+*.jpg
+*.pdf
+debug_*.png
+eval_*.png
+loss_curve.png
+reconstruction_vis.png
+
+# --- E. 系统文件 ---
+.DS_Store
+Thumbs.db
