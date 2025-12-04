@@ -4,6 +4,8 @@ import glob
 import numpy as np
 import pandas as pd
 import torch
+import librosa
+from scipy.stats import kurtosis
 from torch.utils.data import Dataset
 from scipy.interpolate import interp1d # 用于插值重构转速信号
 from config import Config
@@ -63,7 +65,7 @@ class MotorDataset(Dataset):
                 # 如果你在 train/val 阶段请求故障数据，说明代码写错了
                 # 但为了代码兼容性，我们可以返回空，或者抛出警告
                 # 这里为了严谨，我们让它返回空，防止故障数据泄露进训练流程
-                self.data_x = np.empty((0, raw_data_x.shape[1]))
+                self.data_x = np.empty((0, len(Config.COL_INDICES_X)))
                 self.data_speed = np.empty((0, 1))
                 print(f"[Warning] 故障数据 {condition} 不应在 {flag} 阶段使用！")
 
@@ -265,21 +267,103 @@ class MotorDataset(Dataset):
         return np.concatenate(list_x, axis=0), np.concatenate(list_s, axis=0)
 
     def __getitem__(self, index):
-        """
-        核心：生成一个样本 (x, speed_covariate)
-        """
-        idx = index * self.stride
-        x_win = self.data_x[idx: idx + self.window_size]
-        s_win = self.data_speed[idx: idx + self.window_size]
+        # 1. 定位原始数据的切片位置
+        # 注意：这里的 stride 应该是 HOP_LENGTH (帧移)，而不是原始窗口 STRIDE
+        # 论文逻辑：输入是 H 个时间步的特征序列
+        # 假设我们要在数据中取一段长 raw_window 的波形，算出 H 帧特征
 
+        # 简化逻辑：我们预先切好一个大的 raw_window，然后在内部切帧计算特征
+        # 但为了效率，建议离线处理好特征。
+        # 这里为了不改动太大，我们实时计算（可能会慢，但逻辑正确）。
+
+        idx = index * self.stride
+        # 这里取出的长度应该是能够计算出 seq_len 个特征帧的长度
+        # Length ≈ (seq_len - 1) * hop + frame_size
+        raw_len = (self.window_size - 1) * Config.HOP_LENGTH + Config.FRAME_SIZE
+
+        # 边界检查
+        if idx + raw_len > len(self.data_x):
+            # 简单的 padding 或截断处理
+            return torch.zeros((self.window_size, Config.ENC_IN)), torch.zeros((2,))
+
+        raw_x_win = self.data_x[idx: idx + raw_len]  # [Raw_Len, 5]
+        s_win = self.data_speed[idx: idx + raw_len]  # [Raw_Len, 1]
+
+        # === 2. 特征提取 (Feature Extraction) ===
+        feature_list = []
+
+        # A. 振动通道 (前4列: 8,10,11,12) -> 提取 RMS, Kurtosis
+        # data_x 的列顺序对应 Config.COL_INDICES_X
+        n_vib = len(Config.COL_INDICES_VIB)  # 4
+
+        # A. 振动通道 (前4列) -> 提取 RMS, Kurtosis
+        for i in range(n_vib):
+            sig = raw_x_win[:, i]
+            # 切帧: 利用 librosa.util.frame (很方便)
+            frames = librosa.util.frame(sig, frame_length=Config.FRAME_SIZE, hop_length=Config.HOP_LENGTH)
+            # frames shape: [Frame_Size, Seq_Len]
+
+            # RMS
+            rms = np.sqrt(np.mean(frames ** 2, axis=0))
+            # Kurtosis
+            kurt = kurtosis(frames, axis=0, fisher=False)  # fisher=False对应Pearson定义(常态为3)
+
+            feature_list.append(rms)
+            feature_list.append(kurt)
+
+        # B. 声纹通道 (第5列) -> 提取 MFCC
+        audio_sig = raw_x_win[:, -1]  # 假设最后一列是 Audio
+        # librosa 算 MFCC
+        # n_mfcc=14 (取14个，丢第0个剩13个)
+        mfcc = librosa.feature.mfcc(y=audio_sig, sr=Config.SAMPLE_RATE,
+                                    n_mfcc=Config.N_MFCC + 1,
+                                    n_fft=Config.FRAME_SIZE,
+                                    hop_length=Config.HOP_LENGTH,
+                                    center=False)
+        # mfcc shape: [14, Seq_Len]
+        # 丢弃第0阶 (能量)
+        mfcc = mfcc[1:, :]
+
+        feature_list.append(mfcc)  # [13, Seq_Len]
+
+        # 堆叠所有特征 -> [Seq_Len, D_total]
+        # list 中现在有: RMS(L), Kurt(L), ..., MFCC(13, L)
+        # 需要统一转置并拼接
+        processed_feats = []
+        for f in feature_list:
+            if f.ndim == 1:
+                processed_feats.append(f[:, np.newaxis])  # [L, 1]
+            else:
+                processed_feats.append(f.T)  # [L, 13]
+
+        x_features = np.concatenate(processed_feats, axis=1)  # [L, D]
+
+        # # 截断或填充到标准的 window_size (防止计算误差导致的 ±1 帧)
+        # if x_features.shape[0] > self.window_size:
+        #     x_features = x_features[:self.window_size, :]
+        # elif x_features.shape[0] < self.window_size:
+        #     # Padding
+        #     pad_len = self.window_size - x_features.shape[0]
+        #     x_features = np.pad(x_features, ((0, pad_len), (0, 0)), mode='edge')
+
+        # === 3. 协变量 (Speed) ===
+        # 转速也需要这算到对应的帧上，或者取全局均值
+        # 论文里是：每个窗口一个 Speed 向量 [v, v^2] (Scalar)
+        # 你的 RDLinear 设计是输入 [B, 2]，所以这里保持不变
         v_bar = np.mean(s_win)
         v2_bar = np.mean(s_win ** 2)
-
-        # 简单的归一化 (除以 3000 RPM)
         norm_scale = 3000.0
         covariates = np.array([v_bar / norm_scale, v2_bar / (norm_scale ** 2)], dtype=np.float32)
 
-        return torch.from_numpy(x_win), torch.from_numpy(covariates)
+        # [修改] 打印更显眼的标记，证明是最新代码
+        print(f"DEBUG [NEW]: Feature Shape: {x_features.shape}")
+
+        # [新增] 强行断言：如果维度不对，直接在这里炸掉，不要传给模型
+        assert x_features.shape[
+                   1] == 21, f"Fatal Error: Data Loader is generating {x_features.shape[1]} channels instead of 21!"
+
+        print(f"DEBUG: Output Feature Shape: {x_features.shape}")
+        return torch.from_numpy(x_features).float(), torch.from_numpy(covariates).float()
 
     def __len__(self):
         return self.n_samples

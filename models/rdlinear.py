@@ -25,7 +25,14 @@ class RDLinear(nn.Module):
         self.enc_in = len(config.COL_INDICES_VIB) + len(config.COL_INDICES_AUDIO)  # 通道总数
 
         # 1. RevIN 模块 (归一化层)
-        self.revin = RevIN(self.enc_in, affine=True)
+        # 带RevIN 开关
+        self.use_revin = config.USE_REVIN
+        if self.use_revin:
+            self.revin = RevIN(self.enc_in, affine=True)
+
+        # 转速注入开关
+        self.use_speed = config.USE_SPEED
+        self.covariate_dim = 2 if self.use_speed else 0
 
         # 2. 分解模块 (Decomposition)
         # kernel_size 决定了平滑程度，通常取 25 左右用于滤除工频干扰
@@ -53,7 +60,8 @@ class RDLinear(nn.Module):
         # ================= 1. 归一化 (RevIN) =================
         # 消除工况引起的幅值差异 (e.g. 60Hz 能量 > 15Hz 能量)
         # x: [B, L, D]
-        x = self.revin(x, 'norm')
+        if self.use_revin:
+            x = self.revin(x, 'norm')
 
         # ================= 2. 序列分解 =================
         # seasonal: [B, L, D], trend: [B, L, D]
@@ -73,25 +81,20 @@ class RDLinear(nn.Module):
         # 这是论文最关键的一步：将 Speed 信息融合进 Trend
 
         # speed_cov: [B, 2] -> 扩展为 [B, D, 2] 以匹配通道数
-        batch_size, channels, _ = trend_init.shape
-        speed_cov_expanded = speed_cov.unsqueeze(1).repeat(1, channels, 1)
+        if self.use_speed:
+            # 有转速：拼接
+            batch_size, channels, _ = trend_init.shape
+            speed_cov_expanded = speed_cov.unsqueeze(1).repeat(1, channels, 1)
+            trend_with_cov = torch.cat([trend_init, speed_cov_expanded], dim=-1)
+            trend_output = self.linear_trend(trend_with_cov)
+        else:
+            # 无转速：直接过 Linear
+            trend_output = self.linear_trend(trend_init)
 
-        # 拼接: 将转速信息作为额外的"时间步"拼接到趋势序列末尾
-        # trend_with_cov: [B, D, L + 2]
-        trend_with_cov = torch.cat([trend_init, speed_cov_expanded], dim=-1)
-
-        # 通过线性层学习映射: f(Trend_History, Speed) -> Trend_Future
-        # [B, D, L+2] -> [B, D, P]
-        trend_output = self.linear_trend(trend_with_cov)
-
-        # ================= 5. 融合与反归一化 =================
-        # 叠加两分支
         x_out = seasonal_output + trend_output
-
-        # 恢复维度 [B, D, P] -> [B, P, D]
         x_out = x_out.permute(0, 2, 1)
 
-        # 反归一化：恢复物理量纲，让误差具有物理意义 (如 m/s^2)
-        x_out = self.revin(x_out, 'denorm')
+        if self.use_revin:
+            x_out = self.revin(x_out, 'denorm')
 
         return x_out

@@ -16,6 +16,84 @@ from utils.anomaly import AnomalyMeasurer
 plt.rcParams['font.sans-serif'] = ['SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
+# 加噪函数
+def add_noise(x, snr_db):
+    """给声纹通道加噪声 (假设最后一列是声纹)"""
+    if snr_db is None: return x
+
+    # 1. 分离声纹
+    audio_feat = x[:, :, -13:]  # 假设最后13维是MFCC
+
+    # 2. 计算信号功率
+    signal_power = torch.mean(audio_feat ** 2)
+    noise_power = signal_power / (10 ** (snr_db / 10))
+
+    # 3. 生成噪声
+    noise = torch.randn_like(audio_feat, device=x.device) * torch.sqrt(noise_power)
+
+    # 4. 叠加
+    x[:, :, -13:] += noise
+    return x
+
+
+def adaptive_fusion_spe(recon_x, x, config):
+    """
+    实现论文 3.2 节的自适应融合逻辑
+    x, recon_x: [Batch, Seq_Len, D_feature]
+    D_feature 排列: [Vib1_RMS, Vib1_Kurt, Vib2_..., Audio_MFCC...]
+    """
+    batch_size = x.shape[0]
+
+    # 1. 计算残差平方 [B, L, D]
+    res_sq = (x - recon_x) ** 2
+
+    # 2. 分离振动和声纹的残差
+    # 这里的索引需要根据 feature extraction 的拼接顺序来
+    # 假设前 8 列是振动，后 13 列是声纹
+    vib_dim = config.FEAT_DIM_VIB
+
+    res_vib = res_sq[:, :, :vib_dim]  # [B, L, 8]
+    res_audio = res_sq[:, :, vib_dim:]  # [B, L, 13]
+
+    # 3. 计算各模态的 SPE (对时间维和特征维求均值/和)
+    # 振动 SPE: [B] (取最大值池化前的中间状态)
+    # 实际上论文公式(14)是对"每个振动通道"计算 SPE。
+    # 我们简化一下：计算所有振动特征的平均 SPE
+    spe_vib_raw = torch.mean(res_vib, dim=[1, 2])  # [B]
+
+    # 声纹 SPE: [B]
+    spe_audio = torch.mean(res_audio, dim=[1, 2])  # [B]
+
+    # === 4. 实现门控逻辑 (Formula 13-15) ===
+
+    # A. 声纹不确定性 (方差)
+    # 计算声纹残差在时间轴上的方差 [B]
+    # var_audio = torch.var(torch.mean(res_audio, dim=2), dim=1)
+    # 或者简单点，计算声纹 SPE 的波动？
+    # 论文里是：sigma^2_audio(t)
+    var_audio = torch.var(res_audio.reshape(batch_size, -1), dim=1)  # 简化近似
+
+    tau_base = 0.5  # 超参数，需要调
+    k1 = 5.0
+    alpha_uncert = 1.0 / (1.0 + torch.exp(k1 * (var_audio - tau_base)))
+
+    # B. 振动激活
+    # 假设 spe_vib_raw 归一化到了 1 附近 (需要基于训练集统计，这里先简化)
+    th_vib = 1.0
+    k2 = 5.0
+    beta_activate = 1.0 / (1.0 + torch.exp(-k2 * (spe_vib_raw - th_vib)))
+
+    # C. 最终声纹权重
+    alpha_audio = torch.max(alpha_uncert, beta_activate)
+
+    # D. 加权融合 (Formula 16)
+    w_vib = 1.0
+    lambda_audio = 1.2
+    w_audio = lambda_audio * alpha_audio
+
+    final_score = (w_vib * spe_vib_raw + w_audio * spe_audio) / (w_vib + w_audio)
+
+    return final_score.cpu().numpy()
 
 def evaluate_model():
     print(">>> 正在启动验证评估流程...")
@@ -48,11 +126,19 @@ def evaluate_model():
     ds_fault = MotorDataset(flag='test', condition=target_fault)
     dl_fault = DataLoader(ds_fault, batch_size=Config.BATCH_SIZE, shuffle=False)
 
+    # 噪声鲁棒性测试
+    # 在 Config 中定义 TEST_SNR，或者通过参数传入
+
+
     # 4. 计算 SPE 分数
-    def get_spe_list(dataloader):
+    def get_spe_list(dataloader, snr=Config.TEST_NOISE_SNR):
         spe_list = []
         with torch.no_grad():
             for x, cov in dataloader:
+                # 注入噪声模拟恶劣工况
+                if snr is not None:
+                    x = add_noise(x, snr)
+
                 x = x.float().to(device)
                 cov = cov.float().to(device)
 
@@ -61,8 +147,9 @@ def evaluate_model():
 
                 # 计算 SPE: mean((x - x_hat)^2)
                 # 维度: [Batch, Length, Channel] -> [Batch]
-                loss = torch.mean((x - x_hat) ** 2, dim=[1, 2])
-                spe_list.append(loss.cpu().numpy())
+                loss = adaptive_fusion_spe(x_hat, x, Config)
+
+                spe_list.append(loss)
         if len(spe_list) == 0: return np.array([])
         return np.concatenate(spe_list)
 

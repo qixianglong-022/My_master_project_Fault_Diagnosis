@@ -47,13 +47,31 @@ class Config:
     # ================= 4. 信号处理参数 =================
     SAMPLE_RATE = 51200
 
-    # [修正] 窗口大小调整为 4096 (约 80ms)
-    # 理由：最低转频 15Hz (周期~66ms)，4096点能覆盖 >1 个周期，
-    # 既满足物理采样定理，又保证参数量 (4096^2) 在树莓派可接受范围内。
-    WINDOW_SIZE = 4096
+    # 原始数据窗口 (1秒)
+    RAW_WINDOW_SIZE = 51200
 
-    # 无重叠切片，最大化训练效率
-    STRIDE = 4096
+    # 特征提取的“帧”参数
+    # Frame Size: 计算一次特征的时间窗，例如 2048点 (40ms)
+    FRAME_SIZE = 2048
+    # Hop Length: 帧移，例如 1024点 (20ms, 50%重叠)
+    HOP_LENGTH = 1024
+
+    # 最终输入模型的序列长度 (Seq_Len)
+    # 51200 / 1024 ≈ 50 帧
+    WINDOW_SIZE = (RAW_WINDOW_SIZE - FRAME_SIZE) // HOP_LENGTH + 1
+
+    # 无重叠切片原始数据 (训练时)
+    STRIDE = RAW_WINDOW_SIZE
+
+    # 特征维度定义
+    # 振动: 2个特征 (RMS, Kurtosis) * 通道数 = 8
+    FEAT_DIM_VIB = 2 * len(COL_INDICES_VIB)
+    # 声纹: 13个 MFCC 系数 * 通道数 = 13
+    N_MFCC = 13
+    FEAT_DIM_AUDIO = N_MFCC * len(COL_INDICES_AUDIO)
+
+    # 模型总输入维度 (enc_in) = 13 + 8 = 21
+    ENC_IN = FEAT_DIM_VIB + FEAT_DIM_AUDIO
 
     # ================= 5. 训练超参数 =================
     # [修正] 设置为 None 以加载该工况下的所有文件 (含变速工况)
@@ -63,3 +81,14 @@ class Config:
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-3
     EPOCHS = 10
+
+    # ================= 6. 实验控制参数 (New) =================
+    # 模型选择: 'RDLinear', 'DLinear', 'LSTM_AE','Informer', 'Autoformer', 'midruleDLinear', 'TiDE'
+    MODEL_NAME = 'RDLinear' # ours
+
+    # 消融实验开关 (Ablation Flags)
+    USE_REVIN = True  # 是否使用 RevIN
+    USE_SPEED = True  # 是否使用转速引导 Trend
+
+    # 噪声测试 (只在测试时生效)
+    TEST_NOISE_SNR = None  # None表示无噪声，数字表示信噪比(dB)

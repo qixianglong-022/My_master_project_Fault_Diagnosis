@@ -10,11 +10,22 @@ import warnings
 from config import Config
 from data_loader import MotorDataset
 from models.rdlinear import RDLinear
+from models.rdlinear import RDLinear
+# from models.baselines import LSTMAE, VanillaDLinear
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.anomaly import AnomalyMeasurer  # 引入异常检测器
 
 warnings.filterwarnings('ignore')
 
+def get_model(config):
+    if config.MODEL_NAME == 'RDLinear':
+        return RDLinear(config)
+    # elif config.MODEL_NAME == 'LSTM_AE':
+    #     return LSTMAE(input_dim=config.ENC_IN, hidden_dim=64)
+    # elif config.MODEL_NAME == 'DLinear':
+    #     return VanillaDLinear(config) # 不带 RevIN 和 Speed 的版本
+    else:
+        raise ValueError("Unknown Model")
 
 def train():
     # ================= 1. 准备工作 =================
@@ -45,8 +56,8 @@ def train():
     )
 
     # ================= 3. 模型初始化 =================
-    print("Initializing RDLinear model...")
-    model = RDLinear(Config).to(device)
+    print(f"Initializing RDLinear model... Seq_Len={Config.WINDOW_SIZE}, Enc_In={Config.ENC_IN}")
+    model = get_model(Config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
     criterion = nn.MSELoss()
     early_stopping = EarlyStopping(patience=5, verbose=True)
