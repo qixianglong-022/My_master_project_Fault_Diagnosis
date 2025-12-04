@@ -13,6 +13,8 @@ class Config:
     # 结果保存目录
     OUTPUT_DIR = "./checkpoints"
 
+    SCALER_PATH = "./checkpoints/scaler_params.pkl"
+
     # ================= 2. 数据集定义 =================
     # 映射简写代码到实际文件夹名
     DATA_DOMAINS = {
@@ -56,6 +58,14 @@ class Config:
     # Hop Length: 帧移，例如 1024点 (20ms, 50%重叠)
     HOP_LENGTH = 1024
 
+    # 训练时的步长 (单位: 帧)
+    # 比如设为 1，表示每隔一帧取一个窗口 (最大化数据利用率)
+    # 或者设为 WINDOW_SIZE (无重叠)
+    TRAIN_STRIDE_FRAMES = 1
+
+    # 验证/测试时的步长
+    #TEST_STRIDE_FRAMES = RAW_WINDOW_SIZE  # 通常测试时不重叠
+
     # 最终输入模型的序列长度 (Seq_Len)
     # 51200 / 1024 ≈ 50 帧
     WINDOW_SIZE = (RAW_WINDOW_SIZE - FRAME_SIZE) // HOP_LENGTH + 1
@@ -80,7 +90,7 @@ class Config:
 
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-3
-    EPOCHS = 10
+    EPOCHS = 50
 
     # ================= 6. 实验控制参数 (New) =================
     # 模型选择: 'RDLinear', 'DLinear', 'LSTM_AE','Informer', 'Autoformer', 'midruleDLinear', 'TiDE'
@@ -92,3 +102,7 @@ class Config:
 
     # 噪声测试 (只在测试时生效)
     TEST_NOISE_SNR = None  # None表示无噪声，数字表示信噪比(dB)
+
+    # 自适应融合参数保存路径
+    # 存储 tau_base, th_vib 等统计值
+    FUSION_PARAMS_PATH = "./checkpoints/fusion_params.json"

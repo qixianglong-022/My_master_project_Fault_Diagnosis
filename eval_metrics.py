@@ -1,6 +1,7 @@
 # eval_metrics.py
 import os
 import torch
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
@@ -37,6 +38,21 @@ def add_noise(x, snr_db):
 
 
 def adaptive_fusion_spe(recon_x, x, config):
+    # 1. 尝试加载自适应参数
+    try:
+        with open(config.FUSION_PARAMS_PATH, 'r') as f:
+            params = json.load(f)
+        tau_base = params['tau_base']
+        th_vib = params['th_vib']
+        k1 = params['k1']
+        k2 = params['k2']
+    except:
+        # 兜底默认值 (防止第一次运行报错)
+        tau_base = 0.5
+        th_vib = 1.0
+        k1 = 5.0
+        k2 = 5.0
+
     """
     实现论文 3.2 节的自适应融合逻辑
     x, recon_x: [Batch, Seq_Len, D_feature]
@@ -73,14 +89,10 @@ def adaptive_fusion_spe(recon_x, x, config):
     # 论文里是：sigma^2_audio(t)
     var_audio = torch.var(res_audio.reshape(batch_size, -1), dim=1)  # 简化近似
 
-    tau_base = 0.5  # 超参数，需要调
-    k1 = 5.0
     alpha_uncert = 1.0 / (1.0 + torch.exp(k1 * (var_audio - tau_base)))
 
     # B. 振动激活
     # 假设 spe_vib_raw 归一化到了 1 附近 (需要基于训练集统计，这里先简化)
-    th_vib = 1.0
-    k2 = 5.0
     beta_activate = 1.0 / (1.0 + torch.exp(-k2 * (spe_vib_raw - th_vib)))
 
     # C. 最终声纹权重

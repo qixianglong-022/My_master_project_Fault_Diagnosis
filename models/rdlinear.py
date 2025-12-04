@@ -22,7 +22,7 @@ class RDLinear(nn.Module):
         self.pred_len = config.WINDOW_SIZE  # 自监督/重构任务：输入=输出
         # 如果是预测未来，这里 pred_len 可以不同
 
-        self.enc_in = len(config.COL_INDICES_VIB) + len(config.COL_INDICES_AUDIO)  # 通道总数
+        self.enc_in = config.ENC_IN  # 使用 Config 中计算好的特征总维度 (21)
 
         # 1. RevIN 模块 (归一化层)
         # 带RevIN 开关

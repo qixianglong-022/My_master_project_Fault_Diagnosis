@@ -39,7 +39,7 @@ class EarlyStopping:
 def adjust_learning_rate(optimizer, epoch, learning_rate):
     # 简单的衰减策略：每过一个 epoch 衰减一点点，或者根据 epoch 阶段衰减
     # 这里采用 type1: 半衰减
-    lr = learning_rate * (0.5 ** ((epoch - 1) // 2)) 
+    lr = learning_rate * (0.5 ** ((epoch - 1) // 10))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     print('Updating learning rate to {}'.format(lr))

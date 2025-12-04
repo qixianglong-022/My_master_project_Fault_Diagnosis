@@ -4,12 +4,12 @@ import glob
 import numpy as np
 import pandas as pd
 import torch
-import librosa
+import pickle  # 用于保存 scaler
 from scipy.stats import kurtosis
 from torch.utils.data import Dataset
 from scipy.interpolate import interp1d # 用于插值重构转速信号
 from config import Config
-
+from utils.feature_extractor import FeatureExtractor
 
 class MotorDataset(Dataset):
     def __init__(self, flag='train', condition='HH'):
@@ -20,6 +20,7 @@ class MotorDataset(Dataset):
         self.flag = flag
         self.window_size = Config.WINDOW_SIZE
         self.stride = Config.STRIDE
+        self.extractor = FeatureExtractor(Config)
 
         # 1. 获取文件路径
         self.file_paths = self._get_file_paths(condition)
@@ -33,26 +34,40 @@ class MotorDataset(Dataset):
         # 2. 加载数据
         # self.data_x: [Total_Points, N_Channels]
         # self.data_speed: [Total_Points, 1]
-        self.data_x, self.data_speed = self._load_data_with_cache()
+        self.raw_x, self.raw_speed = self._load_data_with_cache()
+
+
+        # 3. 预计算特征 (Offline Feature Extraction) ===
+        # 将耗时的特征提取移到这里，训练时 __getitem__ 就会飞快
+        print(f"[{flag.upper()}] Pre-computing features (this may take a while)...")
+        self.data_features = self._precompute_features(self.raw_x)
+        self.data_speed = self._precompute_speed(self.raw_speed)  # 确保对齐
+
+        # 释放原始数据内存 (如果显存/内存紧张)
+        del self.raw_x
+
+        # === [核心优化] 3. Z-Score 标准化 ===
+        self._apply_z_score_normalization()
 
         # 3. 数据集划分逻辑
         # 如果是健康数据(HH)，我们需要切分成 Train/Val/Test
         # 如果是故障数据(FB, VU...)，全部作为 Test，不参与训练和验证
 
         # 定义切分比例 (6:2:2)
-        total_len = len(self.data_x)
+        total_len = len(self.data_features)
         train_split = int(total_len * 0.6)
         val_split = int(total_len * 0.8)  # 60% + 20%
 
         if condition == 'HH':
             if flag == 'train':
-                self.data_x = self.data_x[:train_split]
+                self.data_features = self.data_features[:train_split]
                 self.data_speed = self.data_speed[:train_split]
+                self.stride = Config.TRAIN_STRIDE_FRAMES
             elif flag == 'val':
-                self.data_x = self.data_x[train_split:val_split]
+                self.data_features = self.data_features[train_split:val_split]
                 self.data_speed = self.data_speed[train_split:val_split]
             elif flag == 'test':
-                self.data_x = self.data_x[val_split:]
+                self.data_features = self.data_features[val_split:]
                 self.data_speed = self.data_speed[val_split:]
             else:
                 raise ValueError(f"Unknown flag: {flag}")
@@ -65,19 +80,100 @@ class MotorDataset(Dataset):
                 # 如果你在 train/val 阶段请求故障数据，说明代码写错了
                 # 但为了代码兼容性，我们可以返回空，或者抛出警告
                 # 这里为了严谨，我们让它返回空，防止故障数据泄露进训练流程
-                self.data_x = np.empty((0, len(Config.COL_INDICES_X)))
+                self.data_features = np.empty((0, len(Config.COL_INDICES_X)))
                 self.data_speed = np.empty((0, 1))
                 print(f"[Warning] 故障数据 {condition} 不应在 {flag} 阶段使用！")
 
         # 4. 计算样本数量
-        if len(self.data_x) < self.window_size:
+        if len(self.data_features) < self.window_size:
             self.n_samples = 0
-            print(f"[Warning] 数据量不足一个窗口 ({len(self.data_x)} < {self.window_size})")
+            print(f"[Warning] 数据量不足一个窗口 ({len(self.data_features)} < {self.window_size})")
         else:
-            self.n_samples = (len(self.data_x) - self.window_size) // self.stride + 1
+            self.n_samples = (len(self.data_features) - self.window_size) // self.stride + 1
 
         print(f"[{flag.upper()}] 工况:{condition} | 文件数:{len(self.file_paths)} | "
-              f"样本数:{self.n_samples} | 信号维度:{self.data_x.shape}")
+              f"样本数:{self.n_samples} | 信号维度:{self.data_features.shape}")
+
+        # 5. 初始化特征提取器
+        self.extractor = FeatureExtractor(Config)
+
+    def _precompute_features(self, raw_data):
+        """一次性提取所有特征"""
+        # 这里可以使用并行加速，或者简单的循环
+        # 为了简单，我们复用之前的逻辑，但应用到整段数据上
+        # 注意：FeatureExtractor 需要支持长序列处理，或者你需要分块处理
+        # 建议简单的分块处理以防内存溢出
+
+        # 简化版：复用 extractor 的逻辑
+        # 假设 raw_data 是 [Total, C]
+        features = []
+
+        # A. 振动
+        for i in range(len(Config.COL_INDICES_VIB)):
+            f = self.extractor.extract_vib_features(raw_data[:, i])  # [Total_Frames, 2]
+            features.append(f)
+
+        # B. 声纹
+        f_audio = self.extractor.extract_audio_features(raw_data[:, -1])  # [Total_Frames, 13]
+        features.append(f_audio)
+
+        # 合并
+        all_feats = np.concatenate(features, axis=1)  # [Total_Frames, 21]
+
+        # 对齐转速 (转速需要降采样到 Frame 级别)
+        # 简单的做法是取每帧对应的转速均值
+        # 这里需要在 __init__ 里同步处理 self.raw_speed
+
+        return all_feats
+
+    def _precompute_speed(self, raw_speed):
+        """
+        将原始高频转速点降采样对齐到特征帧
+        raw_speed: [Total_Points]
+        return: [Total_Frames]
+        """
+        # 计算帧数
+        n_frames = (len(raw_speed) - Config.FRAME_SIZE) // Config.HOP_LENGTH + 1
+
+        # 使用 stride tricks 快速切帧
+        strides = raw_speed.strides
+        shape = (n_frames, Config.FRAME_SIZE)
+        strides = (strides[0] * Config.HOP_LENGTH, strides[0])
+
+        # [N_Frames, Frame_Size]
+        frames = np.lib.stride_tricks.as_strided(raw_speed, shape=shape, strides=strides)
+
+        # 计算每一帧的平均转速
+        speed_frames = np.mean(frames, axis=1)
+        return speed_frames
+
+    def _apply_z_score_normalization(self):
+        scaler_path = os.path.join(Config.OUTPUT_DIR, 'scaler_params.pkl')
+
+        if self.flag == 'train':
+            # 训练集：计算均值和方差并保存
+            print("Calculating Z-Score statistics...")
+            self.mean = np.mean(self.data_features, axis=0)
+            self.std = np.std(self.data_features, axis=0) + 1e-6  # 防止除零
+
+            # 保存参数供 val/test/deploy 使用
+            with open(scaler_path, 'wb') as f:
+                pickle.dump({'mean': self.mean, 'std': self.std}, f)
+            print(f"Scaler saved to {scaler_path}")
+
+        else:
+            # 验证/测试集：加载训练集的参数
+            if not os.path.exists(scaler_path):
+                raise FileNotFoundError("请先运行 flag='train' 生成 Scaler 参数！")
+
+            with open(scaler_path, 'rb') as f:
+                params = pickle.load(f)
+            self.mean = params['mean']
+            self.std = params['std']
+
+        # 应用标准化 (In-place 修改以节省内存)
+        self.data_features = (self.data_features - self.mean) / self.std
+        print("Z-Score normalization applied.")
 
     def _get_file_paths(self, condition):
         folder_name = Config.DATA_DOMAINS.get(condition)
@@ -267,103 +363,35 @@ class MotorDataset(Dataset):
         return np.concatenate(list_x, axis=0), np.concatenate(list_s, axis=0)
 
     def __getitem__(self, index):
-        # 1. 定位原始数据的切片位置
-        # 注意：这里的 stride 应该是 HOP_LENGTH (帧移)，而不是原始窗口 STRIDE
-        # 论文逻辑：输入是 H 个时间步的特征序列
-        # 假设我们要在数据中取一段长 raw_window 的波形，算出 H 帧特征
+        """
+        从预计算好的特征序列中切片
+        index: 滑动窗口的起始帧索引 (Frame Index)
+        """
+        # 1. 确定切片范围
+        # self.window_size 是帧数 (例如 50)
+        # 注意：这里的 index 直接对应帧，不需要乘 HOP_LENGTH
+        start_idx = index
+        end_idx = index + self.window_size
 
-        # 简化逻辑：我们预先切好一个大的 raw_window，然后在内部切帧计算特征
-        # 但为了效率，建议离线处理好特征。
-        # 这里为了不改动太大，我们实时计算（可能会慢，但逻辑正确）。
+        # 2. 获取特征窗口 (Features)
+        # self.data_features 已经是 (Total_Frames, 21) 且做过 Z-Score
+        x_win = self.data_features[start_idx: end_idx]  # [50, 21]
 
-        idx = index * self.stride
-        # 这里取出的长度应该是能够计算出 seq_len 个特征帧的长度
-        # Length ≈ (seq_len - 1) * hop + frame_size
-        raw_len = (self.window_size - 1) * Config.HOP_LENGTH + Config.FRAME_SIZE
+        # 3. 获取转速协变量 (Covariates)
+        # 假设 self.data_speed 也是帧对齐的 [Total_Frames]
+        s_win_frames = self.data_speed[start_idx: end_idx]
 
-        # 边界检查
-        if idx + raw_len > len(self.data_x):
-            # 简单的 padding 或截断处理
-            return torch.zeros((self.window_size, Config.ENC_IN)), torch.zeros((2,))
+        # 计算该窗口的宏观工况 (取帧级别转速的平均)
+        v_bar = np.mean(s_win_frames)
+        v2_bar = np.mean(s_win_frames ** 2)  # E[v^2]
 
-        raw_x_win = self.data_x[idx: idx + raw_len]  # [Raw_Len, 5]
-        s_win = self.data_speed[idx: idx + raw_len]  # [Raw_Len, 1]
-
-        # === 2. 特征提取 (Feature Extraction) ===
-        feature_list = []
-
-        # A. 振动通道 (前4列: 8,10,11,12) -> 提取 RMS, Kurtosis
-        # data_x 的列顺序对应 Config.COL_INDICES_X
-        n_vib = len(Config.COL_INDICES_VIB)  # 4
-
-        # A. 振动通道 (前4列) -> 提取 RMS, Kurtosis
-        for i in range(n_vib):
-            sig = raw_x_win[:, i]
-            # 切帧: 利用 librosa.util.frame (很方便)
-            frames = librosa.util.frame(sig, frame_length=Config.FRAME_SIZE, hop_length=Config.HOP_LENGTH)
-            # frames shape: [Frame_Size, Seq_Len]
-
-            # RMS
-            rms = np.sqrt(np.mean(frames ** 2, axis=0))
-            # Kurtosis
-            kurt = kurtosis(frames, axis=0, fisher=False)  # fisher=False对应Pearson定义(常态为3)
-
-            feature_list.append(rms)
-            feature_list.append(kurt)
-
-        # B. 声纹通道 (第5列) -> 提取 MFCC
-        audio_sig = raw_x_win[:, -1]  # 假设最后一列是 Audio
-        # librosa 算 MFCC
-        # n_mfcc=14 (取14个，丢第0个剩13个)
-        mfcc = librosa.feature.mfcc(y=audio_sig, sr=Config.SAMPLE_RATE,
-                                    n_mfcc=Config.N_MFCC + 1,
-                                    n_fft=Config.FRAME_SIZE,
-                                    hop_length=Config.HOP_LENGTH,
-                                    center=False)
-        # mfcc shape: [14, Seq_Len]
-        # 丢弃第0阶 (能量)
-        mfcc = mfcc[1:, :]
-
-        feature_list.append(mfcc)  # [13, Seq_Len]
-
-        # 堆叠所有特征 -> [Seq_Len, D_total]
-        # list 中现在有: RMS(L), Kurt(L), ..., MFCC(13, L)
-        # 需要统一转置并拼接
-        processed_feats = []
-        for f in feature_list:
-            if f.ndim == 1:
-                processed_feats.append(f[:, np.newaxis])  # [L, 1]
-            else:
-                processed_feats.append(f.T)  # [L, 13]
-
-        x_features = np.concatenate(processed_feats, axis=1)  # [L, D]
-
-        # # 截断或填充到标准的 window_size (防止计算误差导致的 ±1 帧)
-        # if x_features.shape[0] > self.window_size:
-        #     x_features = x_features[:self.window_size, :]
-        # elif x_features.shape[0] < self.window_size:
-        #     # Padding
-        #     pad_len = self.window_size - x_features.shape[0]
-        #     x_features = np.pad(x_features, ((0, pad_len), (0, 0)), mode='edge')
-
-        # === 3. 协变量 (Speed) ===
-        # 转速也需要这算到对应的帧上，或者取全局均值
-        # 论文里是：每个窗口一个 Speed 向量 [v, v^2] (Scalar)
-        # 你的 RDLinear 设计是输入 [B, 2]，所以这里保持不变
-        v_bar = np.mean(s_win)
-        v2_bar = np.mean(s_win ** 2)
+        # 归一化 (与 deploy 保持一致)
         norm_scale = 3000.0
         covariates = np.array([v_bar / norm_scale, v2_bar / (norm_scale ** 2)], dtype=np.float32)
 
-        # [修改] 打印更显眼的标记，证明是最新代码
-        print(f"DEBUG [NEW]: Feature Shape: {x_features.shape}")
-
-        # [新增] 强行断言：如果维度不对，直接在这里炸掉，不要传给模型
-        assert x_features.shape[
-                   1] == 21, f"Fatal Error: Data Loader is generating {x_features.shape[1]} channels instead of 21!"
-
-        print(f"DEBUG: Output Feature Shape: {x_features.shape}")
-        return torch.from_numpy(x_features).float(), torch.from_numpy(covariates).float()
+        # 4. 格式转换
+        # x_win 可能因为切片导致内存不连续，torch 可能会报警，用 copy() 确保安全
+        return torch.from_numpy(x_win.copy()).float(), torch.from_numpy(covariates).float()
 
     def __len__(self):
         return self.n_samples
