@@ -11,7 +11,6 @@ import json
 from config import Config
 from data_loader import MotorDataset
 from models.rdlinear import RDLinear
-from models.rdlinear import RDLinear
 # from models.baselines import LSTMAE, VanillaDLinear
 from utils.tools import EarlyStopping, adjust_learning_rate
 from utils.anomaly import AnomalyMeasurer  # 引入异常检测器
