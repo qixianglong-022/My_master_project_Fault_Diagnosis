@@ -123,7 +123,16 @@ class EdgeSentinel:
         try:
             for chunk in reader:
                 data = chunk.values
-                speeds = data[:, 0]  # 第1列是转速
+                # STM32 已经传上来了计算好的 RPM 值 (例如 1500.0)
+                # ========================================================
+
+                # 获取 RPM 列 (假设在第0列)
+                # 建议加一个简单的异常值过滤，防止通信干扰产生 NaN 或 负数
+                raw_rpms = data[:, 0]
+                raw_rpms = np.where(raw_rpms < 0, 0, raw_rpms)  # 简单的物理约束
+                raw_rpms = np.nan_to_num(raw_rpms, nan=0.0)
+
+                speeds = raw_rpms
                 sensors = data[:, 1:]  # 后面是传感器
 
                 self.buffer_speed.extend(speeds)

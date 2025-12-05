@@ -1,6 +1,20 @@
 import numpy as np
 import torch
 
+def apply_moving_average(scores, window_size=5):
+    """
+    对 SPE 分数序列进行滑动平均平滑
+    :param scores: 1D numpy array, 原始 SPE 分数
+    :param window_size: 窗口大小 (建议 3~10)
+    :return: 平滑后的 SPE
+    """
+    if len(scores) < window_size:
+        return scores
+    # 使用 'valid' 模式会缩短序列，'same' 模式会产生边缘效应
+    # 工业上通常用简易的 valid 卷积，然后前面补 pad，或者直接用 same
+    # 这里推荐 'same' 模式保持长度一致，方便对齐
+    return np.convolve(scores, np.ones(window_size)/window_size, mode='same')
+
 class EarlyStopping:
     """
     早停机制：当验证集损失在 patience 个 epoch 内不再下降时，停止训练。

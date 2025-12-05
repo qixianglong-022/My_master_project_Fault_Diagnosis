@@ -4,13 +4,10 @@ import os
 
 class Config:
     # ================= 1. 路径设置 =================
-    # 数据集根目录
-    DATA_ROOT = r"C:\毕业材料_齐祥龙\电机故障数据集\实验台数据采集"
+    # 原子数据目录
+    ATOMIC_DATA_DIR = "./processed_data_atomic"
 
-    # 缓存目录 (加速二次读取)
-    CACHE_DIR = "./cache_data"
-
-    # 结果保存目录
+    # 结果输出根目录
     OUTPUT_DIR = "./checkpoints"
 
     SCALER_PATH = "./checkpoints/scaler_params.pkl"
@@ -28,7 +25,22 @@ class Config:
         'FB': '第8组——电机健康状态：轴承故障（FB）',
     }
 
-    # ================= 物理通道定义 (关键！) =================
+    # ================= 3. 训练集定义 (Source Domain) =================
+    # 200kg (2) 下的 Speed 1, 3, 5, 7
+    # 格式: (Load, Speed)
+    TRAIN_ATOMS = [
+        ('2', '1'), ('2', '3'), ('2', '5'), ('2', '7')
+    ]
+
+    # ================= 4. 测试集定义 (Dynamic Target Domain) =================
+    # 这里只定义“当前”要跑的测试集。
+    # 你可以手动修改这里来单跑某个工况，或者由外部脚本动态覆盖它。
+
+    # 默认值：手动 Debug 时用，例如只想看 200kg 下 30Hz 的表现
+    TEST_TASK_NAME = "Manual_Debug_200kg_30Hz"
+    TEST_ATOMS = [('2', '2')]
+
+    # ================= 5. 物理通道定义 =================
     # 根据TXT的 Legend 确定列索引
     # 原始列：Time(0), 转速(1), ..., 电机振动(8), ...,测试轴承X(10), 测试轴承Y(11), 测试轴承Z(12)..., 噪声1-1(20)...
     # 注意：pandas读取时如果包含Time列，索引如下：
@@ -46,7 +58,7 @@ class Config:
     # 自动合并所有输入通道 (用于 data_loader 读取)
     COL_INDICES_X = COL_INDICES_VIB + COL_INDICES_AUDIO
 
-    # ================= 4. 信号处理参数 =================
+    # ================= 6. 信号处理参数 =================
     SAMPLE_RATE = 51200
 
     # 原始数据窗口 (1秒)
@@ -83,18 +95,20 @@ class Config:
     # 模型总输入维度 (enc_in) = 13 + 8 = 21
     ENC_IN = FEAT_DIM_VIB + FEAT_DIM_AUDIO
 
-    # ================= 5. 训练超参数 =================
+    # ================= 7. 训练超参数 =================
     # [修正] 设置为 None 以加载该工况下的所有文件 (含变速工况)
     # 如果内存不足 (OOM)，可改为整数 (如 4) 并手动挑选代表性文件
     LIMIT_FILES = None
 
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-3
-    EPOCHS = 50
+    EPOCHS = 100
 
-    # ================= 6. 实验控制参数 (New) =================
+    # ================= 8. 实验控制参数 (New) =================
     # 模型选择: 'RDLinear', 'DLinear', 'LSTM_AE','Informer', 'Autoformer', 'midruleDLinear', 'TiDE'
-    MODEL_NAME = 'RDLinear' # ours
+    # MODEL_NAME = 'RDLinear' # ours
+    # MODEL_NAME = 'LSTM_AE'
+    MODEL_NAME = 'RDLinear'
 
     # 消融实验开关 (Ablation Flags)
     USE_REVIN = True  # 是否使用 RevIN

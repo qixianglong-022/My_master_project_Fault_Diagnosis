@@ -18,7 +18,7 @@ class LSTMAE(nn.Module):
         :param hidden_dim: LSTM 隐藏层维度
         """
         super(LSTMAE, self).__init__()
-
+        self.enc_in = input_dim
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers

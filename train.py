@@ -11,26 +11,36 @@ import json
 from config import Config
 from data_loader import MotorDataset
 from models.rdlinear import RDLinear
-# from models.baselines import LSTMAE, VanillaDLinear
-from utils.tools import EarlyStopping, adjust_learning_rate
-from utils.anomaly import AnomalyMeasurer  # 引入异常检测器
+from models.baselines import LSTMAE, VanillaDLinear
+from utils.tools import EarlyStopping, adjust_learning_rate, apply_moving_average
 
 warnings.filterwarnings('ignore')
 
 def get_model(config):
     if config.MODEL_NAME == 'RDLinear':
         return RDLinear(config)
-    # elif config.MODEL_NAME == 'LSTM_AE':
-    #     return LSTMAE(input_dim=config.ENC_IN, hidden_dim=64)
-    # elif config.MODEL_NAME == 'DLinear':
-    #     return VanillaDLinear(config) # 不带 RevIN 和 Speed 的版本
+    elif config.MODEL_NAME == 'LSTM_AE':
+        return LSTMAE(input_dim=config.ENC_IN, hidden_dim=64)
+    elif config.MODEL_NAME == 'DLinear':
+        return VanillaDLinear(config) # 不带 RevIN 和 Speed 的版本
     else:
         raise ValueError("Unknown Model")
 
 def train():
     # ================= 1. 准备工作 =================
+    # [新增] 将输出目录改为 ./checkpoints/{MODEL_NAME}
+    # 这样跑 RDLinear 就存到 ./checkpoints/RDLinear
+    # 跑 LSTM_AE 就存到 ./checkpoints/LSTM_AE
+    Config.OUTPUT_DIR = os.path.join(
+        Config.OUTPUT_DIR,
+        Config.MODEL_NAME,
+        "Source_Model_200kg"
+    )
+
     if not os.path.exists(Config.OUTPUT_DIR):
         os.makedirs(Config.OUTPUT_DIR)
+
+    print(f">>> 实验结果将保存至: {Config.OUTPUT_DIR}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -60,7 +70,7 @@ def train():
     model = get_model(Config).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
     criterion = nn.MSELoss()
-    early_stopping = EarlyStopping(patience=15, verbose=True) # Loss 曲线在下降过程中会有波动，给它一点耐心，不要过早停止。
+    early_stopping = EarlyStopping(patience=30, verbose=True) # Loss 曲线在下降过程中会有波动，给它一点耐心，不要过早停止。
 
     # 用于记录 Loss 曲线
     loss_history = {'train': [], 'val': []}
@@ -73,14 +83,21 @@ def train():
         model.train()
         epoch_time = time.time()
 
-        for i, (batch_x, batch_cov) in enumerate(train_loader):
+        for i, (batch_x, batch_y, batch_cov) in enumerate(train_loader):  # 接收3个返回值
             iter_count += 1
             batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)  # 新增 Target
             batch_cov = batch_cov.float().to(device)
 
             optimizer.zero_grad()
+
+            # 模型输入 batch_x，预测 outputs
             outputs = model(batch_x, batch_cov)
-            loss = criterion(outputs, batch_x)
+
+            # === 核心修改：Loss 计算 ===
+            # 让输出去拟合 batch_y (未来)，而不是 batch_x (现在)
+            loss = criterion(outputs, batch_y)
+
             train_loss.append(loss.item())
 
             loss.backward()
@@ -108,111 +125,126 @@ def train():
 
         adjust_learning_rate(optimizer, epoch + 1, Config.LEARNING_RATE)
 
-    # ================= 5. 自动生成 POT 阈值 (关键步骤) =================
-    print("\n>>> Calculating Anomaly Threshold (POT)...")
+    # ================= 5. 计算自适应参数 =================
+    print("\n>>> Calculating Adaptive Fusion Parameters (Step 1)...")
+
     # 加载最佳模型
     best_model_path = os.path.join(Config.OUTPUT_DIR, 'checkpoint.pth')
     model.load_state_dict(torch.load(best_model_path))
     model.eval()
 
-    # 在验证集上计算所有样本的重构误差 (SPE)
-    spe_list = []
+    # --- 第一遍扫描：计算统计特性 (tau_base, th_vib) ---
+    all_vib_means = []
+    all_audio_vars = []
+
     with torch.no_grad():
-        for batch_x, batch_cov in val_loader:
+        for batch_x, batch_y, batch_cov in val_loader:
             batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)
             batch_cov = batch_cov.float().to(device)
-            outputs = model(batch_x, batch_cov)
 
-            # 计算 SPE (Batch, )
-            # 简单的 MSE: mean((x - x_hat)^2)
-            errors = torch.mean((batch_x - outputs) ** 2, dim=[1, 2])
-            spe_list.append(errors.cpu().numpy())
-
-    val_spe = np.concatenate(spe_list)
-
-    # 使用极值理论 (POT) 拟合阈值
-    detector = AnomalyMeasurer(q=1e-3, level=0.98)  # q=1e-3 意味着允许 0.1% 的误报
-    threshold = detector.fit_pot(val_spe)
-
-    # 保存阈值
-    np.save(os.path.join(Config.OUTPUT_DIR, 'test_threshold.npy'), threshold)
-    print(f"Threshold saved to: {os.path.join(Config.OUTPUT_DIR, 'test_threshold.npy')}")
-
-    # ================= 6. 计算自适应参数 =================
-
-    print("\n>>> Calculating Adaptive Fusion Parameters...")
-    # 1. 获取验证集的所有残差
-    # 假设 val_spe 是 [N_Samples] 的总误差，这里我们需要分通道的误差
-    # 我们需要重新跑一次验证集，获取原始的分量残差
-
-    res_vib_list = []
-    res_audio_list = []
-
-    model.eval()
-    with torch.no_grad():
-        for batch_x, batch_cov in val_loader:
-            batch_x = batch_x.float().to(device)
-            batch_cov = batch_cov.float().to(device)
             recon = model(batch_x, batch_cov)
 
-            # 计算残差 (x - x_hat)^2
-            res = (batch_x - recon) ** 2  # [B, L, D]
+            # 计算基础残差: (真实未来 - 预测未来)^2
+            res_sq = (batch_y - recon) ** 2  # [B, L, D]
 
-            # 拆分通道 (根据 Config 里的维度)
+            # 1. 振动均值 (用于确定激活阈值 th_vib)
             dim_vib = Config.FEAT_DIM_VIB
+            vib_mean = torch.mean(res_sq[:, :, :dim_vib], dim=[1, 2])
+            all_vib_means.append(vib_mean.cpu().numpy())
 
-            # 振动部分误差 (取均值) -> [B]
-            r_v = torch.mean(res[:, :, :dim_vib], dim=[1, 2])
-            # 声纹部分误差 (这里我们需要的是方差特性，用于计算 tau_base)
-            # 论文公式: sigma^2_audio(t) 是声纹残差在时间窗内的方差
-            # res_audio: [B, L, D_audio]
-            res_audio = batch_x[:, :, dim_vib:] - recon[:, :, dim_vib:]
-            # 计算每个样本在时间轴上的方差，并对通道取平均
-            r_a_var = torch.mean(torch.var(res_audio, dim=1), dim=1)  # [B]
+            # 2. 声纹方差 (用于确定底噪 tau_base)
+            # 声纹残差
+            res_audio = batch_y[:, :, dim_vib:] - recon[:, :, dim_vib:]
+            # 计算每个样本在时间轴上的方差
+            audio_var = torch.var(res_audio.reshape(batch_x.shape[0], -1), dim=1)
+            all_audio_vars.append(audio_var.cpu().numpy())
 
-            res_vib_list.append(r_v.cpu().numpy())
-            res_audio_list.append(r_a_var.cpu().numpy())
-
-    all_vib_spe = np.concatenate(res_vib_list)
-    all_audio_var = np.concatenate(res_audio_list)
-
-    # 2. 计算统计参数
-    # tau_base: 健康声纹残差方差的中位数 (代表背景底噪水平)
-    tau_base = float(np.median(all_audio_var))
-
-    # th_vib: 健康振动 SPE 的上界 (例如 99 分位点，作为激活阈值)
-    # 超过这个值，说明振动肯定异常，强制激活
-    th_vib = float(np.percentile(all_vib_spe, 99))
+    # 合并并计算统计值
+    all_vib_means = np.concatenate(all_vib_means)
+    all_audio_vars = np.concatenate(all_audio_vars)
 
     params = {
-        "tau_base": tau_base,
-        "th_vib": th_vib,
-        "k1": 5.0,  # 灵敏度系数暂时保持固定，或者通过网格搜索优化
+        "tau_base": float(np.median(all_audio_vars)),  # 声纹底噪基准
+        "th_vib": float(np.percentile(all_vib_means, 99)),  # 振动激活阈值 (99分位)
+        "k1": 5.0,  # 灵敏度系数
         "k2": 5.0
     }
 
-    # 3. 保存
+    # 保存参数
     with open(Config.FUSION_PARAMS_PATH, 'w') as f:
         json.dump(params, f, indent=4)
-    print(f"Adaptive parameters saved to: {Config.FUSION_PARAMS_PATH}")
-    print(f"  tau_base (Audio Noise Floor): {tau_base:.6f}")
-    print(f"  th_vib (Vibration Max Normal): {th_vib:.6f}")
+    print(f"Adaptive parameters saved: tau={params['tau_base']:.6f}, th_vib={params['th_vib']:.6f}")
 
-    # ================= 7. 可视化诊断（loss曲线） =================
-    print("\n>>> Generating Diagnostic Plots...")
+    # --- 第二遍扫描：计算融合分数并定阈值 (Step 2) ---
+    print("\n>>> Calculating Anomaly Threshold (Step 2)...")
 
-    # 6.1 画 Loss 曲线
-    plt.figure(figsize=(10, 5))
-    plt.plot(loss_history['train'], label='Train Loss')
-    plt.plot(loss_history['val'], label='Val Loss')
-    plt.title('Training Loss Curve')
-    plt.xlabel('Epochs')
-    plt.ylabel('MSE Loss')
-    plt.legend()
-    plt.savefig(os.path.join(Config.OUTPUT_DIR, 'loss_curve.png'))
-    plt.close()
+    all_scores = []
 
-    # ================= 8. 可视化诊断 (重构效果图) =================
+    # 定义一个临时的计算函数 (为了保持 train.py 独立，不依赖 eval_metrics)
+    def calculate_score_batch(y_true, y_pred, p):
+        res_sq = (y_true - y_pred) ** 2
+        dim_vib = Config.FEAT_DIM_VIB
+
+        # 1. 分量 SPE
+        spe_vib = torch.mean(res_sq[:, :, :dim_vib], dim=[1, 2])
+        spe_audio = torch.mean(res_sq[:, :, dim_vib:], dim=[1, 2])
+
+        # 2. 门控权重
+        res_audio_raw = y_true[:, :, dim_vib:] - y_pred[:, :, dim_vib:]
+        var_audio = torch.var(res_audio_raw.reshape(y_true.shape[0], -1), dim=1)
+
+        alpha_uncert = 1.0 / (1.0 + torch.exp(p['k1'] * (var_audio - p['tau_base'])))
+        beta_activate = 1.0 / (1.0 + torch.exp(-p['k2'] * (spe_vib - p['th_vib'])))
+
+        alpha_audio = torch.max(alpha_uncert, beta_activate)
+
+        # 3. 融合
+        w_vib = 1.0
+        w_audio = 1.2 * alpha_audio
+        score = (w_vib * spe_vib + w_audio * spe_audio) / (w_vib + w_audio)
+        return score
+
+    with torch.no_grad():
+        for batch_x, batch_y, batch_cov in val_loader:
+            batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)
+            batch_cov = batch_cov.float().to(device)
+
+            recon = model(batch_x, batch_cov)
+
+            # 使用刚刚算好的参数计算分数
+            scores = calculate_score_batch(batch_y, recon, params)
+            all_scores.append(scores.cpu().numpy())
+
+    all_scores = np.concatenate(all_scores)
+
+    # 应用移动平均滤波
+    # 这一步能把那个 0.07 的离群最大值抹平，显著降低阈值
+    print(f"Applying Moving Average (Window=5)...")
+    all_scores = apply_moving_average(all_scores, window_size=5)
+
+    # === 方案一：使用 99.9% 分位数作为阈值 (比 POT 更稳健) ===
+    # 工业现场通常不希望阈值太敏感，99.9% 能过滤掉绝大多数正常波动
+    # threshold = np.percentile(all_scores, 99.9)
+
+    # === 方案二：改用 MAD 鲁棒阈值 ===
+    # MAD 是 "Median Absolute Deviation"，抗干扰能力极强
+    median = np.median(all_scores)
+    mad = np.median(np.abs(all_scores - median))
+
+    # 工业界常用 K=3 到 K=5。
+    # 如果你想提高 Recall (多抓故障)，就调小 K (比如 3.5)
+    # 如果你想提高 Precision (少误报)，就调大 K (比如 5.0)
+    # 鉴于你的 AUC 不错但 Recall 低，建议先试 3.5 或 4.0
+    K = 3.5
+    threshold = median + K * mad
+
+    np.save(os.path.join(Config.OUTPUT_DIR, 'test_threshold.npy'), threshold)
+    print(f"Threshold (99.9%): {threshold:.6f} (Mean Score: {np.mean(all_scores):.6f})")
+    print(f"Threshold saved to: {os.path.join(Config.OUTPUT_DIR, 'test_threshold.npy')}")
+
+    # ================= 6. 可视化诊断 (重构效果图) =================
     print("\n>>> Generating Reconstruction Plots for ALL Channels...")
 
     # 1. 创建可视化目录
@@ -246,15 +278,15 @@ def train():
 
     # 4. 循环绘制每个通道
     for ch_idx in range(model.enc_in):
-        orig = batch_x[sample_idx, :, ch_idx].cpu().numpy()
-        recon = outputs[sample_idx, :, ch_idx].cpu().numpy()
+        orig = batch_y[sample_idx, :, ch_idx].cpu().numpy()  # [Fix] 改为 batch_y
+        pred = recon[sample_idx, :, ch_idx].cpu().numpy()  # 这是模型预测值
 
         feature_name = all_names[ch_idx]
 
         plt.figure(figsize=(10, 4))
-        plt.plot(orig, label='Original', alpha=0.7)
-        plt.plot(recon, label='Reconstructed', alpha=0.7, linestyle='--')
-        plt.title(f'Reconstruction: {feature_name} (Idx {ch_idx})')
+        plt.plot(orig, label='True Future (Target)', alpha=0.7)  # 改标签名
+        plt.plot(pred, label='Predicted Future', alpha=0.7, linestyle='--')
+        plt.title(f'Prediction: {feature_name} (Idx {ch_idx})')
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
@@ -287,11 +319,13 @@ def validation(model, val_loader, criterion, device):
     model.eval()
     total_loss = []
     with torch.no_grad():
-        for batch_x, batch_cov in val_loader:
+        for batch_x, batch_y, batch_cov in val_loader:  # 接收3个
             batch_x = batch_x.float().to(device)
+            batch_y = batch_y.float().to(device)
             batch_cov = batch_cov.float().to(device)
+
             outputs = model(batch_x, batch_cov)
-            loss = criterion(outputs, batch_x)
+            loss = criterion(outputs, batch_y)  # 拟合 Target
             total_loss.append(loss.item())
     return np.average(total_loss)
 
