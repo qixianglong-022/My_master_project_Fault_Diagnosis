@@ -86,9 +86,7 @@ results/
 
 # 阈值文件 (虽然小，但属于生成文件，建议忽略，或者手动管理)
 # *.npy  <-- 如果你想保留阈值文件，可以注释掉这一行，但我建议忽略所有生成的 npy
-test_threshold.npy
-*_spe.npy
-*_labels.npy
+*.npy
 
 # --- D. 临时测试图 (Visualization) ---
 # 我们代码中生成的 debug 图片，不需要版本控制
