@@ -4,12 +4,10 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
 from sklearn.metrics import roc_auc_score, f1_score
-
-from config import Config
 from data_loader import MotorDataset
 from models.rdlinear import RDLinear
 from utils.anomaly import InferenceEngine
-
+from config import Config
 
 def run_evaluation_loop():
     # 1. 准备环境
@@ -97,12 +95,20 @@ def run_evaluation_loop():
             import traceback
             traceback.print_exc()
 
-    # 4. 保存报表
+    # 4. 保存报表 (支持追加模式，防止多轮测试覆盖)
     if results_summary:
         df = pd.DataFrame(results_summary)
         csv_path = os.path.join(Config.OUTPUT_DIR, "eval_results", "summary_report.csv")
-        df.to_csv(csv_path, index=False)
-        print(f"\n>>> Done. Report: {csv_path}")
+
+        # 检查文件是否存在
+        if os.path.exists(csv_path):
+            # 追加写入，不写 Header
+            df.to_csv(csv_path, mode='a', header=False, index=False)
+        else:
+            # 新建写入
+            df.to_csv(csv_path, mode='w', header=True, index=False)
+
+        print(f"\n>>> Done. Report updated: {csv_path}")
 
 
 if __name__ == '__main__':
