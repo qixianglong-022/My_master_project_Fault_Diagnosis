@@ -1,4 +1,3 @@
-# data_loader.py
 import os
 import torch
 import numpy as np
@@ -8,150 +7,107 @@ from config import Config
 
 
 class MotorDataset(Dataset):
-    def __init__(self, flag='train', atoms=None):
+    def __init__(self, atoms_list, mode='train', fault_types=None, noise_snr=None):
         """
-        :param flag: 'train' / 'val' / 'test'
-        :param atoms: list of (Load, Speed). 如果为 None，则根据 flag 自动从 Config 读取。
+        :param atoms_list: list of (Load, Speed)
+        :param mode: 'train' (HH only), 'test' (HH + Faults)
+        :param noise_snr: float (dB) or None. 仅在测试模式生效。
         """
         self.window_size = Config.WINDOW_SIZE
+        self.predict_step = Config.PREDICT_STEP
+        self.mode = mode
+        self.atoms_list = atoms_list
+        self.noise_snr = noise_snr  # <--- 接收接口参数
 
-        # 1. 确定要加载的原子列表
-        if atoms is not None:
-            target_atoms = atoms
+        # 1. 确定 Domain
+        if mode == 'train':
+            self.domains = ['HH']
         else:
-            # 如果没传，根据 flag 决定默认行为
-            if flag == 'train' or flag == 'val':
-                target_atoms = Config.TRAIN_ATOMS
-            else:
-                target_atoms = Config.TEST_ATOMS  # 默认测试集
-
-        self.target_atoms = target_atoms
-        self.flag = flag
+            target_faults = fault_types if fault_types else Config.TEST_FAULT_TYPES
+            self.domains = ['HH'] + target_faults
 
         # 2. 加载数据
-        # 训练集只加载 HH，测试集需要同时支持 HH 和 FB 的逻辑
-        # 这里为了通用，我们默认加载 HH。如果是测试 FB，需要在外部通过专门的类或方法区分。
-        # 简化方案：增加一个 condition 参数，默认为 'HH'
-        self.features, self.speeds = self._load_atoms(condition='HH')
+        self.x, self.s, self.y, self.labels = self._load_data()
 
-        # 3. 标准化 (Z-Score)
+        # 3. 归一化
         self._apply_scaler()
 
-        # 4. 内部划分 (Train/Val Split)
-        self._split_data()
+        # 4. 计算长度
+        self.stride = Config.STRIDE // Config.HOP_LENGTH if mode == 'train' else self.window_size
+        self.n_samples = (len(self.x) - self.window_size - self.predict_step) // self.stride + 1
+        if self.n_samples < 0: self.n_samples = 0
 
-    def _load_atoms(self, condition):
-        """加载指定工况列表的所有 .npy 文件"""
-        data_list = []
-        speed_list = []
+    def _load_data(self):
+        xs, ss, ys, ls = [], [], [], []
 
-        for load, speed in self.target_atoms:
-            # 文件名格式: HH_2_1.npy
-            fname_x = f"{condition}_{load}_{speed}.npy"
-            fname_s = f"{condition}_{load}_{speed}_S.npy"
+        for domain in self.domains:
+            # 简单标签: HH=0, 其他=1
+            label = 0 if domain == 'HH' else 1
 
-            path_x = os.path.join(Config.ATOMIC_DATA_DIR, fname_x)
-            path_s = os.path.join(Config.ATOMIC_DATA_DIR, fname_s)
+            for (load, speed) in self.atoms_list:
+                fn_x = f"{domain}_{load}_{speed}.npy"
+                fn_s = f"{domain}_{load}_{speed}_S.npy"
+                path_x = os.path.join(Config.ATOMIC_DATA_DIR, fn_x)
+                path_s = os.path.join(Config.ATOMIC_DATA_DIR, fn_s)
 
-            if os.path.exists(path_x):
-                x = np.load(path_x)  # [N, 21]
-                s = np.load(path_s)  # [N, 1]
-                data_list.append(x)
-                speed_list.append(s)
-            else:
-                # 容错：如果找不到，静默跳过或打印警告
-                # print(f"[Warn] Missing atom: {fname_x}")
-                pass
+                if os.path.exists(path_x):
+                    x_data = np.load(path_x)
+                    s_data = np.load(path_s)
 
-        if not data_list:
-            return np.empty((0, Config.ENC_IN)), np.empty((0, 1))
+                    # === 噪声注入接口 ===
+                    # 仅在测试模式且 noise_snr 不为 None 时触发
+                    if self.mode == 'test' and self.noise_snr is not None:
+                        x_data = self._add_noise(x_data, self.noise_snr)
 
-        return np.concatenate(data_list, axis=0), np.concatenate(speed_list, axis=0)
+                    xs.append(x_data)
+                    ss.append(s_data)
+                    ys.append(x_data)  # 自监督: Target = Input
+                    ls.append(np.ones(len(x_data)) * label)
 
-    def set_condition(self, condition):
-        """【关键】用于测试时切换 HH/FB"""
-        # 重新加载数据
-        self.features, self.speeds = self._load_atoms(condition)
-        # 重新标准化
-        self._apply_scaler()
-        # 重新计算长度
-        self._split_data()  # Reset to full length
+        if not xs: return np.empty((0, Config.ENC_IN)), np.empty((0, 1)), [], []
+        return np.concatenate(xs), np.concatenate(ss), np.concatenate(ys), np.concatenate(ls)
+
+    def _add_noise(self, data, snr_db):
+        """
+        向声纹通道注入高斯白噪声
+        """
+        # 假设声纹在最后几列 (根据 Config 逻辑)
+        # 这里为了简单，对所有通道注入，或者你可以只对 Audio 注入
+        # 既然是环境噪声，通常振动和声纹都会受影响，但声纹更明显。
+        # 这里的实现是对全通道加噪：
+        signal_power = np.mean(data ** 2)
+        noise_power = signal_power / (10 ** (snr_db / 10))
+        noise = np.random.normal(0, np.sqrt(noise_power), data.shape)
+        return data + noise
 
     def _apply_scaler(self):
-        # 统一使用 Source Domain (Load 2) 的参数
-        # 假设训练脚本会生成这个文件
-        scaler_path = os.path.join(Config.OUTPUT_DIR, "source_scaler.pkl")
-
-        if self.flag == 'train' and not os.path.exists(scaler_path):
-            # 如果是第一次训练，计算并保存
-            self.mean = np.mean(self.features, axis=0)
-            self.std = np.std(self.features, axis=0) + 1e-6
-            # 确保目录存在
-            os.makedirs(os.path.dirname(scaler_path), exist_ok=True)
-            with open(scaler_path, 'wb') as f:
+        if self.mode == 'train':
+            self.mean = np.mean(self.x, axis=0)
+            self.std = np.std(self.x, axis=0) + 1e-6
+            os.makedirs(os.path.dirname(Config.SCALER_PATH), exist_ok=True)
+            with open(Config.SCALER_PATH, 'wb') as f:
                 pickle.dump({'mean': self.mean, 'std': self.std}, f)
         else:
-            # 其他情况（Val, Test），加载参数
-            if os.path.exists(scaler_path):
-                with open(scaler_path, 'rb') as f:
-                    params = pickle.load(f)
-                self.mean = params['mean']
-                self.std = params['std']
+            if os.path.exists(Config.SCALER_PATH):
+                with open(Config.SCALER_PATH, 'rb') as f:
+                    p = pickle.load(f)
+                    self.mean, self.std = p['mean'], p['std']
             else:
-                # 兜底
-                self.mean = 0
-                self.std = 1
+                self.mean, self.std = 0, 1
 
-        self.features = (self.features - self.mean) / self.std
+        self.x = (self.x - self.mean) / self.std
+        self.y = (self.y - self.mean) / self.std
 
-    def _split_data(self):
-        total = len(self.features)
-        if total == 0:
-            self.n_samples = 0
-            return
+    def __getitem__(self, idx):
+        i = idx * self.stride
+        x_win = self.x[i: i + self.window_size]
+        s_win = self.s[i: i + self.window_size]
+        y_win = self.y[i + self.predict_step: i + self.window_size + self.predict_step]
 
-        if self.flag == 'train':
-            # 80% 用于训练
-            split = int(total * 0.8)
-            self.features = self.features[:split]
-            self.speeds = self.speeds[:split]
-            self.stride = 1
-        elif self.flag == 'val':
-            # 20% 用于验证
-            split = int(total * 0.8)
-            self.features = self.features[split:]
-            self.speeds = self.speeds[split:]
-            self.stride = self.window_size  # 不重叠
-        else:
-            # Test 全量
-            self.stride = self.window_size
+        v = np.mean(s_win)
+        cov = np.array([v, v ** 2], dtype=np.float32)
 
-        if len(self.features) > self.window_size:
-            self.n_samples = (len(self.features) - self.window_size) // self.stride + 1
-        else:
-            self.n_samples = 0
-
-    def __getitem__(self, index):
-        start_idx = index * self.stride
-        end_idx = start_idx + self.window_size
-
-        # 预测偏移 (Next-Step Prediction)
-        PREDICT_STEP = 3
-
-        # 边界保护
-        if end_idx + PREDICT_STEP > len(self.features):
-            start_idx = len(self.features) - self.window_size - PREDICT_STEP
-            end_idx = start_idx + self.window_size
-
-        x_win = self.features[start_idx:end_idx]
-        y_win = self.features[start_idx + PREDICT_STEP: end_idx + PREDICT_STEP]
-        s_win = self.speeds[start_idx:end_idx]
-
-        v_bar = np.mean(s_win)
-        v2_bar = np.mean(s_win ** 2)
-        cov = np.array([v_bar / 3000.0, v2_bar / (3000.0 ** 2)], dtype=np.float32)
-
-        return torch.from_numpy(x_win).float(), torch.from_numpy(y_win).float(), torch.from_numpy(cov).float()
+        return torch.FloatTensor(x_win), torch.FloatTensor(y_win), torch.FloatTensor(cov), self.labels[i]
 
     def __len__(self):
         return self.n_samples

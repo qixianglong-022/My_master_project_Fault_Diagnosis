@@ -1,64 +1,158 @@
-import numpy as np
 import torch
-import torch.nn as nn
-from scipy.stats import genpareto
+import numpy as np
+import os
+import json
+from config import Config
 
 
-class AnomalyMeasurer:
+class InferenceEngine:
     """
-    异常检测器：计算 SPE 并利用 POT (Peaks-Over-Threshold) 极值理论自动确定阈值。
+    封装模型推理、自适应融合与阈值计算逻辑。
+    实现 'Small & Beautiful' 的核心组件。
     """
 
-    def __init__(self, q=1e-3, level=0.98):
+    def __init__(self, model, fusion_params_path=None):
+        self.model = model
+        self.device = next(model.parameters()).device
+        self.fusion_params = None
+
+        # 尝试加载自适应融合参数 (tau_base, th_vib 等)
+        # 如果路径未传，尝试从 Config 默认路径加载
+        path = fusion_params_path if fusion_params_path else Config.FUSION_PARAMS_PATH
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                self.fusion_params = json.load(f)
+                # print(f"[Info] Loaded fusion params: {self.fusion_params}")
+
+    def predict(self, data_loader):
         """
-        :param q: 风险系数 (Risk probability), 例如 1e-3 代表允许 0.1% 的误报
-        :param level: POT 算法中用于筛选峰值的百分位，默认 98%
+        执行推理并计算融合后的异常得分。
+        Returns:
+            scores (np.array): [N, ] 融合后的异常得分
+            labels (np.array): [N, ] 真实标签
         """
-        self.q = q
-        self.level = level
-        self.threshold = None
+        self.model.eval()
+        scores_list = []
+        labels_list = []
 
-    def calculate_spe(self, preds, trues):
+        with torch.no_grad():
+            for x, y, cov, label in data_loader:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                cov = cov.to(self.device)
+
+                # 1. 模型重构/预测
+                pred = self.model(x, cov)
+
+                # 2. 计算 Batch 的异常得分
+                batch_score = self._calculate_batch_score(y, pred)
+
+                scores_list.append(batch_score.cpu().numpy())
+                labels_list.append(label.numpy())
+
+        return np.concatenate(scores_list), np.concatenate(labels_list)
+
+    def _calculate_batch_score(self, y_true, y_pred):
         """
-        计算平方预测误差 (Squared Prediction Error)
+        核心物理融合逻辑 (对应论文 4.3 节)
         """
-        # preds, trues: [Batch, Length, Channel]
-        if isinstance(preds, torch.Tensor):
-            preds = preds.detach().cpu().numpy()
-        if isinstance(trues, torch.Tensor):
-            trues = trues.detach().cpu().numpy()
+        # 计算平方残差 [B, L, D]
+        res_sq = (y_true - y_pred) ** 2
 
-        errors = (preds - trues) ** 2
-        # 在时间维和通道维求均值 -> [Batch]
-        spe_scores = np.mean(errors, axis=(1, 2))
-        return spe_scores
+        # === 简单模式：如果没有融合参数，退化为 Mean SPE ===
+        if self.fusion_params is None:
+            return torch.mean(res_sq, dim=[1, 2])
 
-    def fit_pot(self, train_spe_scores):
+        # === 高级模式：自适应融合 ===
+        p = self.fusion_params
+        dim_vib = Config.FEAT_DIM_VIB
+
+        # 1. 分量 SPE (振动 vs 声纹)
+        # [B]
+        spe_vib = torch.mean(res_sq[:, :, :dim_vib], dim=[1, 2])
+        spe_audio = torch.mean(res_sq[:, :, dim_vib:], dim=[1, 2])
+
+        # 2. 计算声纹不确定性 (Variance)
+        # [B]
+        diff_audio = y_true[:, :, dim_vib:] - y_pred[:, :, dim_vib:]
+        var_audio = torch.var(diff_audio.reshape(y_true.size(0), -1), dim=1)
+
+        # 3. 双重门控系数
+        # Alpha (不确定性抑制): 方差越大，信度越低
+        alpha_uncert = 1.0 / (1.0 + torch.exp(p['k1'] * (var_audio - p['tau_base'])))
+
+        # Beta (故障强制激活): 振动越大，强制拉高声纹权重
+        beta_activate = 1.0 / (1.0 + torch.exp(-p['k2'] * (spe_vib - p['th_vib'])))
+
+        # 最终声纹权重
+        w_audio_dynamic = torch.max(alpha_uncert, beta_activate)
+
+        # 4. 加权融合
+        # 振动权重恒为 1.0，声纹权重动态调整 (并乘灵敏度系数 lambda=1.2)
+        w_vib = 1.0
+        w_audio = 1.2 * w_audio_dynamic
+
+        score = (w_vib * spe_vib + w_audio * spe_audio) / (w_vib + w_audio + 1e-6)
+        return score
+
+    def fit_threshold(self, val_loader):
         """
-        在验证集（健康数据）上拟合 POT 阈值
+        利用验证集/训练集计算 MAD 阈值，并保存融合参数。
         """
-        threshold_init = np.percentile(train_spe_scores, 100 * self.level)
-        peaks = train_spe_scores[train_spe_scores > threshold_init] - threshold_init
+        print(">>> Fitting Adaptive Threshold & Fusion Params...")
+        self.model.eval()
 
-        # 广义帕累托分布拟合
-        c, loc, scale = genpareto.fit(peaks)
+        # --- Step 1: 扫描统计特性 (确定底噪和激活阈值) ---
+        all_vib_spe = []
+        all_audio_vars = []
 
-        # 计算动态阈值
-        n = len(train_spe_scores)
-        Nt = len(peaks)
+        with torch.no_grad():
+            for x, y, cov, _ in val_loader:
+                x, y, cov = x.to(self.device), y.to(self.device), cov.to(self.device)
+                pred = self.model(x, cov)
 
-        # 避免除零
-        if c == 0:
-            self.threshold = threshold_init - scale * np.log(self.q * n / Nt)
-        else:
-            self.threshold = threshold_init + (scale / c) * (((self.q * n / Nt) ** (-c)) - 1)
+                # 振动 SPE
+                res_sq = (y - pred) ** 2
+                dim_vib = Config.FEAT_DIM_VIB
+                spe_vib = torch.mean(res_sq[:, :, :dim_vib], dim=[1, 2])
+                all_vib_spe.append(spe_vib.cpu().numpy())
 
-        # 安全系数
-        self.threshold = self.threshold * 1.5
-        print(f"[POT] Initial Th: {threshold_init:.5f}, Final Th: {self.threshold:.5f}")
-        return self.threshold
+                # 声纹 Variance
+                diff_audio = y[:, :, dim_vib:] - pred[:, :, dim_vib:]
+                var_audio = torch.var(diff_audio.reshape(x.size(0), -1), dim=1)
+                all_audio_vars.append(var_audio.cpu().numpy())
 
-    def detect(self, test_spe_scores):
-        if self.threshold is None:
-            raise ValueError("Run fit_pot first!")
-        return (test_spe_scores > self.threshold).astype(int)
+        all_vib_spe = np.concatenate(all_vib_spe)
+        all_audio_vars = np.concatenate(all_audio_vars)
+
+        # 自动计算参数
+        params = {
+            "tau_base": float(np.median(all_audio_vars)),  # 声纹底噪
+            "th_vib": float(np.percentile(all_vib_spe, 99)),  # 振动激活阈值 (99分位)
+            "k1": 5.0,  # Sigmoid 陡度
+            "k2": 5.0
+        }
+
+        # 保存参数
+        os.makedirs(os.path.dirname(Config.FUSION_PARAMS_PATH), exist_ok=True)
+        with open(Config.FUSION_PARAMS_PATH, 'w') as f:
+            json.dump(params, f, indent=4)
+        print(f"   [Params Saved] tau_base={params['tau_base']:.4f}, th_vib={params['th_vib']:.4f}")
+
+        # 更新当前的 engine 实例
+        self.fusion_params = params
+
+        # --- Step 2: 计算融合后的 MAD 阈值 ---
+        scores, _ = self.predict(val_loader)
+
+        median = np.median(scores)
+        mad = np.median(np.abs(scores - median))
+
+        # K=3.5 ~ 4.0 对应约 99% 的置信度
+        threshold = median + 3.5 * mad
+
+        save_path = os.path.join(Config.OUTPUT_DIR, 'threshold.npy')
+        np.save(save_path, threshold)
+        print(f"   [Threshold Saved] Th={threshold:.4f} (Median={median:.4f}, MAD={mad:.4f})")
+
+        return threshold

@@ -1,19 +1,83 @@
-# config.py
 import os
 
 
 class Config:
-    # ================= 1. 路径设置 =================
-    # 原子数据目录
-    ATOMIC_DATA_DIR = "./processed_data_atomic"
+    # ================= 1. 基础路径 =================
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+    DATA_ROOT = r"C:\毕业材料_齐祥龙\电机故障数据集\实验台数据采集"
+    ATOMIC_DATA_DIR = os.path.join(PROJECT_ROOT, "processed_data_atomic")
+    OUTPUT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+    SCALER_PATH = os.path.join(OUTPUT_DIR, "scaler_params.pkl") # 归一化参数保存路径
+    FUSION_PARAMS_PATH = os.path.join(OUTPUT_DIR, "fusion_params.json") # 自适应融合参数保存路径
 
-    # 结果输出根目录
-    OUTPUT_DIR = "./checkpoints"
+    # ================= 2. 映射关系 (物理量 -> 文件ID) =================
+    LOAD_MAP = {0: '0', 200: '2', 400: '4'}
+    SPEED_MAP = {
+        '15': '1', '30': '2', '45': '3', '60': '4',
+        '15-45': '5', '30-60': '6', '45-15': '7', '60-30': '8'
+    }
 
-    SCALER_PATH = "./checkpoints/scaler_params.pkl"
+    # ================= 3. 数据集定义 (物理工况) =================
+    # 训练集: 200kg 下的 4 种工况
+    TRAIN_ATOMS = [
+        (200, '15'), (200, '45'), (200, '15-45'), (200, '45-15')
+    ]
 
-    # ================= 2. 数据集定义 =================
-    # 映射简写代码到实际文件夹名
+    # 测试集列表: 程序会自动循环跑这些工况，并生成对应的文件夹
+    # 示例: 测试 400kg 下的所有转速工况
+    TEST_ATOMS = [
+        (400, '15'), (400, '45'), (400, '15-45'), (400, '45-15')
+    ]
+
+    # 测试目标故障类型
+    # 可以在这里显式指定要测试哪些故障，而不是默认 FB
+    # 可选值对应 DATA_DOMAINS 的 Key: 'RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB'
+    TEST_FAULT_TYPES = ['FB']
+    # 如果想同时测不平衡和轴承: TEST_FAULT_TYPES = ['RU', 'FB']
+
+    # ================= 4. 物理通道与维度 =================
+    # 原始列：Time(0), 转速(1), ..., 电机振动(8), ...,测试轴承X(10), 测试轴承Y(11), 测试轴承Z(12)..., 噪声1-1(20)...
+    # 核心协变量通道
+    COL_INDEX_SPEED = 1  # 转速
+    # [振动通道]: 8(电机振动), 10(轴承X), 11(轴承Y), 12(轴承Z)
+    COL_INDICES_VIB = [8, 10, 11, 12]
+    # [声纹通道]: 20(噪声1-1 - 假设这是信噪比最好的)
+    COL_INDICES_AUDIO = [20]
+    # 自动合并所有输入通道 (用于 data_loader 读取)
+    COL_INDICES_X = COL_INDICES_VIB + COL_INDICES_AUDIO
+
+    # ================= 5. 特征维度定义 =================
+    # 振动: 2个特征 (RMS, Kurtosis) * 通道数
+    FEAT_DIM_VIB = 2 * len(COL_INDICES_VIB)  # 2 * 4 = 8
+    # 声纹: 13个 MFCC 系数 * 通道数
+    N_MFCC = 13
+    FEAT_DIM_AUDIO = N_MFCC * len(COL_INDICES_AUDIO)  # 13 * 1 = 13
+    # 模型总输入维度 (enc_in) = 8 + 13 = 21
+    ENC_IN = FEAT_DIM_VIB + FEAT_DIM_AUDIO
+
+    # ================= 6. 数据处理参数 =================
+    SAMPLE_RATE = 51200
+    RAW_WINDOW_SIZE = 51200
+    FRAME_SIZE = 2048
+    HOP_LENGTH = 1024
+    WINDOW_SIZE = (RAW_WINDOW_SIZE - FRAME_SIZE) // HOP_LENGTH + 1
+    STRIDE = RAW_WINDOW_SIZE
+    PREDICT_STEP = 3
+
+    # ================= 7. 模型与训练 =================
+    # 模型选择: 'RDLinear', 'DLinear', 'LSTM_AE','Informer', 'Autoformer', 'midruleDLinear', 'TiDE'
+    MODEL_NAME = 'RDLinear'
+    BATCH_SIZE = 64
+    EPOCHS = 50
+    LEARNING_RATE = 1e-3
+
+    # 消融实验
+    USE_REVIN = True
+    USE_SPEED = True
+    # 噪声测试 (None 或 dB值)
+    TEST_NOISE_SNR = None
+
+    # 路径映射 (保持之前的 DATA_DOMAINS)
     DATA_DOMAINS = {
         'HH': '第1组——电机健康状态：健康（HH）',
         'RU': '第2组——电机健康状态：转子不平衡（RU）',
@@ -24,99 +88,3 @@ class Config:
         'KA': '第7组——电机健康状态：转子条断裂故障（KA）',
         'FB': '第8组——电机健康状态：轴承故障（FB）',
     }
-
-    # ================= 3. 训练集定义 (Source Domain) =================
-    # 200kg (2) 下的 Speed 1, 3, 5, 7
-    # 格式: (Load, Speed)
-    TRAIN_ATOMS = [
-        ('2', '1'), ('2', '3'), ('2', '5'), ('2', '7')
-    ]
-
-    # ================= 4. 测试集定义 (Dynamic Target Domain) =================
-    # 这里只定义“当前”要跑的测试集。
-    # 你可以手动修改这里来单跑某个工况，或者由外部脚本动态覆盖它。
-
-    # 默认值：手动 Debug 时用，例如只想看 200kg 下 30Hz 的表现
-    TEST_TASK_NAME = "Manual_Debug_200kg_30Hz"
-    TEST_ATOMS = [('2', '2')]
-
-    # ================= 5. 物理通道定义 =================
-    # 根据TXT的 Legend 确定列索引
-    # 原始列：Time(0), 转速(1), ..., 电机振动(8), ...,测试轴承X(10), 测试轴承Y(11), 测试轴承Z(12)..., 噪声1-1(20)...
-    # 注意：pandas读取时如果包含Time列，索引如下：
-
-    # 核心协变量通道
-    COL_INDEX_SPEED = 1  # 转速
-
-    # 核心监测通道 (模型输入 x)
-    # [振动通道]: 8(电机振动), 10(轴承X), 11(轴承Y), 12(轴承Z)
-    COL_INDICES_VIB = [8, 10, 11, 12]
-
-    # [声纹通道]: 20(噪声1-1 - 假设这是信噪比最好的)
-    COL_INDICES_AUDIO = [20]
-
-    # 自动合并所有输入通道 (用于 data_loader 读取)
-    COL_INDICES_X = COL_INDICES_VIB + COL_INDICES_AUDIO
-
-    # ================= 6. 信号处理参数 =================
-    SAMPLE_RATE = 51200
-
-    # 原始数据窗口 (1秒)
-    RAW_WINDOW_SIZE = 51200
-
-    # 特征提取的“帧”参数
-    # Frame Size: 计算一次特征的时间窗，例如 2048点 (40ms)
-    FRAME_SIZE = 2048
-    # Hop Length: 帧移，例如 1024点 (20ms, 50%重叠)
-    HOP_LENGTH = 1024
-
-    # 训练时的步长 (单位: 帧)
-    # 比如设为 1，表示每隔一帧取一个窗口 (最大化数据利用率)
-    # 或者设为 WINDOW_SIZE (无重叠)
-    TRAIN_STRIDE_FRAMES = 1
-
-    # 验证/测试时的步长
-    #TEST_STRIDE_FRAMES = RAW_WINDOW_SIZE  # 通常测试时不重叠
-
-    # 最终输入模型的序列长度 (Seq_Len)
-    # 51200 / 1024 ≈ 50 帧
-    WINDOW_SIZE = (RAW_WINDOW_SIZE - FRAME_SIZE) // HOP_LENGTH + 1
-
-    # 无重叠切片原始数据 (训练时)
-    STRIDE = RAW_WINDOW_SIZE
-
-    # 特征维度定义
-    # 振动: 2个特征 (RMS, Kurtosis) * 通道数 = 8
-    FEAT_DIM_VIB = 2 * len(COL_INDICES_VIB)
-    # 声纹: 13个 MFCC 系数 * 通道数 = 13
-    N_MFCC = 13
-    FEAT_DIM_AUDIO = N_MFCC * len(COL_INDICES_AUDIO)
-
-    # 模型总输入维度 (enc_in) = 13 + 8 = 21
-    ENC_IN = FEAT_DIM_VIB + FEAT_DIM_AUDIO
-
-    # ================= 7. 训练超参数 =================
-    # [修正] 设置为 None 以加载该工况下的所有文件 (含变速工况)
-    # 如果内存不足 (OOM)，可改为整数 (如 4) 并手动挑选代表性文件
-    LIMIT_FILES = None
-
-    BATCH_SIZE = 32
-    LEARNING_RATE = 1e-3
-    EPOCHS = 100
-
-    # ================= 8. 实验控制参数 (New) =================
-    # 模型选择: 'RDLinear', 'DLinear', 'LSTM_AE','Informer', 'Autoformer', 'midruleDLinear', 'TiDE'
-    # MODEL_NAME = 'RDLinear' # ours
-    # MODEL_NAME = 'LSTM_AE'
-    MODEL_NAME = 'RDLinear'
-
-    # 消融实验开关 (Ablation Flags)
-    USE_REVIN = True  # 是否使用 RevIN
-    USE_SPEED = True  # 是否使用转速引导 Trend
-
-    # 噪声测试 (只在测试时生效)
-    TEST_NOISE_SNR = None  # None表示无噪声，数字表示信噪比(dB)
-
-    # 自适应融合参数保存路径
-    # 存储 tau_base, th_vib 等统计值
-    FUSION_PARAMS_PATH = "./checkpoints/fusion_params.json"
