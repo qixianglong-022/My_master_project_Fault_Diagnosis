@@ -32,7 +32,9 @@ class Config:
     # 测试目标故障类型
     # 可以在这里显式指定要测试哪些故障，而不是默认 FB
     # 可选值对应 DATA_DOMAINS 的 Key: 'RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB'
-    TEST_FAULT_TYPES = ['RU']
+    # TEST_FAULT_TYPES = ['RU']
+    # 全量测试
+    TEST_FAULT_TYPES = ['RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB']
     # 如果想同时测不平衡和轴承: TEST_FAULT_TYPES = ['RU', 'FB']
 
     # ================= 4. 物理通道与维度 =================
@@ -47,11 +49,21 @@ class Config:
     COL_INDICES_X = COL_INDICES_VIB + COL_INDICES_AUDIO
 
     # ================= 5. 特征维度定义 =================
+    USE_MFCC = True
+    USE_LFCC = True
+
+    N_MFCC = 20
+    N_LFCC = 20
+
+    # 计算总声纹维度：
+    _audio_dim = 0
+    if USE_MFCC: _audio_dim += N_MFCC
+    if USE_LFCC: _audio_dim += N_LFCC
+    FEAT_DIM_AUDIO = _audio_dim * len(COL_INDICES_AUDIO)
+
     # 振动: 2个特征 (RMS, Kurtosis) * 通道数
     FEAT_DIM_VIB = 2 * len(COL_INDICES_VIB)  # 2 * 4 = 8
-    # 声纹: 13个 MFCC 系数 * 通道数
-    N_MFCC = 13
-    FEAT_DIM_AUDIO = N_MFCC * len(COL_INDICES_AUDIO)  # 13 * 1 = 13
+
     # 模型总输入维度 (enc_in) = 8 + 13 = 21
     ENC_IN = FEAT_DIM_VIB + FEAT_DIM_AUDIO
 
@@ -72,7 +84,7 @@ class Config:
     LEARNING_RATE = 1e-3
 
     # 消融实验
-    USE_REVIN = True
+    USE_REVIN = False
     USE_SPEED = True
     # 噪声测试 (None 或 dB值)
     TEST_NOISE_SNR = None
