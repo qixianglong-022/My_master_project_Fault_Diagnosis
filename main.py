@@ -89,7 +89,11 @@ def apply_overrides(args):
     else:
         print(f"[Warn] Scenario '{args.scenario}' not found, using Config default.")
 
-    # 2. 应用消融实验配置 (Ablation)
+    # 2. [新增] 应用模型配置
+    if args.model_name:
+        Config.MODEL_NAME = args.model_name
+
+    # 3. 应用消融实验配置 (Ablation)
     if args.ablation == 'full':
         Config.USE_SPEED = True
         Config.USE_REVIN = True
@@ -100,20 +104,21 @@ def apply_overrides(args):
         Config.USE_SPEED = True
         Config.USE_REVIN = False  # 禁用 RevIN
 
-    # 3. 应用噪声配置
+    # 4. 应用噪声配置
     # 注意：args.noise_snr 为 None 时表示不加噪
     Config.TEST_NOISE_SNR = args.noise_snr
 
-    # 4. 常规超参覆盖
+    # 5. 常规超参覆盖
     if args.lr: Config.LEARNING_RATE = args.lr
     if args.batch_size: Config.BATCH_SIZE = args.batch_size
     if args.epochs: Config.EPOCHS = args.epochs
 
-    # 5. 实验命名自动化 (如果不指定，自动生成)
+    # 6. 实验命名自动化 (包含模型名)
     if args.exp_name is None:
-        # 自动生成名称: scenario_ablation_noise
-        noise_str = f"_{args.noise_snr}dB" if args.noise_snr is not None else ""
-        args.exp_name = f"{args.scenario}_{args.ablation}{noise_str}"
+        # 自动生成名称结构: Scenario_ModelName_Ablation_Noise
+        # 例如: baseline_RDLinear_full
+        noise_str = f"_noise{args.noise_snr}dB" if args.noise_snr is not None else ""
+        args.exp_name = f"{args.scenario}_{Config.MODEL_NAME}_{args.ablation}{noise_str}"
 
     # 更新路径
     Config.OUTPUT_DIR = os.path.join(Config.PROJECT_ROOT, "checkpoints", args.exp_name)
@@ -158,6 +163,9 @@ def main():
     # --- 核心控制 ---
     parser.add_argument('--mode', type=str, default='train', choices=['preprocess', 'train', 'eval', 'all'])
     parser.add_argument('--exp_name', type=str, default=None, help='实验文件夹名(留空则自动生成)')
+    parser.add_argument('--model_name', type=str, default=None,
+                        choices=['RDLinear', 'DLinear', 'LSTMAE'],
+                        help='选择模型架构')
 
     # --- 场景与消融 (The Elegant Part) ---
     parser.add_argument('--scenario', type=str, default='baseline', choices=SCENARIOS.keys(),
