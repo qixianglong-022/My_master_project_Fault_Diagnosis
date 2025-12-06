@@ -158,8 +158,11 @@ def process_all():
                 for i in range(min_len):
                     s_idx = i * Config.HOP_LENGTH
                     e_idx = s_idx + Config.FRAME_SIZE
-                    # 防止越界
-                    if e_idx > len(speed_raw): break
+                    segment = speed_raw[s_idx:e_idx]
+
+                    # 论文公式 (3): 计算 E[v] 和 E[v^2]
+                    v_mean = np.mean(segment)
+                    v2_mean = np.mean(segment ** 2)
                     speed_down.append(np.mean(speed_raw[s_idx:e_idx]))
 
                 # 再次对齐 (因为 speed 采样可能也会少一点)

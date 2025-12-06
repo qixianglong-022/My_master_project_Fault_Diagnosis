@@ -142,17 +142,22 @@ class InferenceEngine:
         # 更新当前的 engine 实例
         self.fusion_params = params
 
-        # --- Step 2: 计算融合后的 MAD 阈值 ---
+        # --- Step 2: 1. 获取所有验证样本的 SPE
         scores, _ = self.predict(val_loader)
 
+        # 2. 鲁棒统计量计算
         median = np.median(scores)
         mad = np.median(np.abs(scores - median))
 
-        # K=3.5 ~ 4.0 对应约 99% 的置信度
-        threshold = median + 3.5 * mad
+        # 3. 这里的 Trick：不要死板地用 3.5
+        # 我们保存 median 和 mad，推理时允许动态调整 sensitivity
+        threshold_params = {'median': float(median), 'mad': float(mad)}
 
-        save_path = os.path.join(Config.OUTPUT_DIR, 'threshold.npy')
-        np.save(save_path, threshold)
-        print(f"   [Threshold Saved] Th={threshold:.4f} (Median={median:.4f}, MAD={mad:.4f})")
+        # 默认推荐阈值 (保守型)
+        default_th = median + 3.0 * mad
 
-        return threshold
+        print(f"   Median={median:.4f}, MAD={mad:.4f} -> Default Th={default_th:.4f}")
+
+        # 保存参数而不是直接保存阈值
+        np.save(os.path.join(Config.OUTPUT_DIR, 'threshold_params.npy'), threshold_params)
+        return default_th

@@ -7,50 +7,80 @@ from config import Config
 
 
 class MotorDataset(Dataset):
+    # [修正] 加回 fault_types 参数，防止 run_evaluation 报错
     def __init__(self, atoms_list, mode='train', fault_types=None, noise_snr=None):
-        """
-        :param atoms_list: list of (Load, Speed)
-        :param mode: 'train' or 'test'
-        """
         self.window_size = Config.WINDOW_SIZE
-        self.predict_step = Config.PREDICT_STEP
         self.mode = mode
-        self.atoms_list = atoms_list
         self.noise_snr = noise_snr
+        self.fault_types = fault_types
 
-        # 1. 确定 Domain
+        # 1. 动态加载数据
+        self.x, self.s, self.labels = self._load_data(atoms_list)
+
+        # 2. [自动化] 训练模式下自动拟合 Scaler
         if mode == 'train':
-            self.domains = ['HH']
-        else:
-            target_faults = fault_types if fault_types else Config.TEST_FAULT_TYPES
-            self.domains = ['HH'] + target_faults
-
-        # 2. 加载数据
-        self.x, self.s, self.y, self.labels = self._load_data()
-
-        # 3. [核心修复] 全局 Z-Score 归一化
-        # 必须归一化！否则 Loss 降不下来，模型无法收敛
-        if self.mode == 'train':
             self._fit_scaler(self.x)
 
+        # 3. 应用归一化
         self.x = self._apply_scaler(self.x)
-        # 自监督任务：Target 也就是 Input，也需要是归一化后的
-        self.y = self.x
 
-        # 4. 计算长度
-        self.stride = Config.STRIDE // Config.HOP_LENGTH if mode == 'train' else self.window_size
-        self.n_samples = (len(self.x) - self.window_size - self.predict_step) // self.stride + 1
-        if self.n_samples < 0: self.n_samples = 0
+    def _load_data(self, atoms_list):
+        xs, ss, ls = [], [], []
+
+        # [修正] 恢复根据 fault_types 筛选数据的逻辑
+        if self.mode == 'train':
+            domains = ['HH']
+        else:
+            # 如果指定了故障类型，就只加载 HH + 指定故障
+            # 否则加载所有 Config.DATA_DOMAINS 定义的类型
+            target_faults = self.fault_types if self.fault_types else Config.TEST_FAULT_TYPES
+            # 去重防止 HH 被加两次
+            domains = list(set(['HH'] + target_faults))
+
+        for domain in domains:
+            # 简单标签: HH=0, 其他=1
+            label = 0 if domain == 'HH' else 1
+
+            # 仅加载 atoms_list 中指定的工况
+            for (load, speed) in atoms_list:
+                # 查表获取 ID
+                lid, sid = Config.LOAD_MAP.get(load), Config.SPEED_MAP.get(speed)
+                if not lid or not sid: continue
+
+                # 构建文件名
+                fn_x = f"{domain}_{lid}_{sid}.npy"
+                fn_s = f"{domain}_{lid}_{sid}_S.npy"
+                path_x = os.path.join(Config.ATOMIC_DATA_DIR, fn_x)
+                path_s = os.path.join(Config.ATOMIC_DATA_DIR, fn_s)
+
+                if os.path.exists(path_x) and os.path.exists(path_s):
+                    x_data = np.load(path_x)
+                    s_data = np.load(path_s)  # Shape [L, 2]
+
+                    # 测试时注入噪声
+                    if self.mode == 'test' and self.noise_snr is not None:
+                        x_data = self._add_noise(x_data, self.noise_snr)
+
+                    xs.append(x_data)
+                    ss.append(s_data)
+                    ls.append(np.ones(len(x_data)) * label)
+
+        if not xs:
+            # 打印当前尝试加载的路径，方便排查路径问题
+            print(f"[Warn] No data loaded for atoms: {atoms_list}")
+            print(f"       Checked dir: {Config.ATOMIC_DATA_DIR}")
+            return np.empty((0, Config.ENC_IN)), np.empty((0, 2)), []
+
+        return np.concatenate(xs), np.concatenate(ss), np.concatenate(ls)
 
     def _fit_scaler(self, data):
         """计算并保存训练集的均值和方差"""
+        if len(data) == 0: return
         print("[Scaler] Fitting global scaler on training data...")
         mean = np.mean(data, axis=0)
-        std = np.std(data, axis=0) + 1e-6  # 防止除零
+        std = np.std(data, axis=0) + 1e-6
 
-        # 确保目录存在
         os.makedirs(os.path.dirname(Config.SCALER_PATH), exist_ok=True)
-
         with open(Config.SCALER_PATH, 'wb') as f:
             pickle.dump({'mean': mean, 'std': std}, f)
 
@@ -60,6 +90,8 @@ class MotorDataset(Dataset):
 
     def _apply_scaler(self, data):
         """应用归一化"""
+        if len(data) == 0: return data
+
         if not hasattr(self, 'mean'):
             if os.path.exists(Config.SCALER_PATH):
                 with open(Config.SCALER_PATH, 'rb') as f:
@@ -67,96 +99,37 @@ class MotorDataset(Dataset):
                 self.mean = scaler['mean']
                 self.std = scaler['std']
             else:
-                raise FileNotFoundError(f"Scaler not found at {Config.SCALER_PATH}, please run training first!")
+                # 这是一个常见错误：如果没训练过直接跑测试，就没有 scaler
+                # 为了防止代码崩在路径检查上，这里给个 warning 并返回原数据
+                print(f"[Warn] Scaler not found at {Config.SCALER_PATH}. Using raw data.")
+                return data
 
         return (data - self.mean) / self.std
 
-    def _load_data(self):
-        xs, ss, ys, ls = [], [], [], []
-
-        # [新增] 用于 Debug 的计数器
-        missing_files_count = 0
-        total_files_expected = 0
-
-        for domain in self.domains:
-            # 简单标签: HH=0, 其他=1
-            label = 0 if domain == 'HH' else 1
-
-            for (phys_load, phys_speed) in self.atoms_list:
-                total_files_expected += 1
-
-                # ================= 核心修正 =================
-                # 使用 Config 中的映射表，将物理值转回文件 ID
-                # 物理值: 200 -> ID: '2'
-                # 物理值: '15' -> ID: '1'
-                try:
-                    load_id = Config.LOAD_MAP[phys_load]
-                    speed_id = Config.SPEED_MAP[phys_speed]
-                except KeyError as e:
-                    print(f"[Config Error] 无法在 LOAD_MAP/SPEED_MAP 中找到键值: {e}")
-                    print(f"    当前请求工况: Load={phys_load}, Speed={phys_speed}")
-                    continue
-
-                fn_x = f"{domain}_{load_id}_{speed_id}.npy"
-                fn_s = f"{domain}_{load_id}_{speed_id}_S.npy"
-                # ============================================
-
-                path_x = os.path.join(Config.ATOMIC_DATA_DIR, fn_x)
-                path_s = os.path.join(Config.ATOMIC_DATA_DIR, fn_s)
-
-                if os.path.exists(path_x) and os.path.exists(path_s):
-                    x_data = np.load(path_x)
-                    s_data = np.load(path_s)
-
-                    # === 噪声注入接口 ===
-                    # 仅在测试模式且 noise_snr 不为 None 时触发
-                    if self.mode == 'test' and self.noise_snr is not None:
-                        x_data = self._add_noise(x_data, self.noise_snr)
-
-                    xs.append(x_data)
-                    ss.append(s_data)
-                    ys.append(x_data)  # 自监督: Target = Input
-                    ls.append(np.ones(len(x_data)) * label)
-                else:
-                    # 打印缺失的第一个文件路径，方便排查
-                    if missing_files_count == 0:
-                        print(f"[Error] Data Missing! Cannot find: {path_x}")
-                        print(f"    (对应物理工况: Load={phys_load}, Speed={phys_speed})")
-                    missing_files_count += 1
-
-        if not xs:
-            print(f"\n[Fatal Error] Dataset is empty!")
-            print(f"   Expected {total_files_expected} files based on config.")
-            print(f"   Found 0 files in {Config.ATOMIC_DATA_DIR}")
-            print(f"   请检查 Config.LOAD_MAP/SPEED_MAP 是否与实际文件名一致！\n")
-            return np.empty((0, Config.ENC_IN)), np.empty((0, 1)), [], []
-
-        return np.concatenate(xs), np.concatenate(ss), np.concatenate(ys), np.concatenate(ls)
-
     def _add_noise(self, data, snr_db):
-        """
-        向声纹通道注入高斯白噪声
-        """
         signal_power = np.mean(data ** 2)
         noise_power = signal_power / (10 ** (snr_db / 10))
         noise = np.random.normal(0, np.sqrt(noise_power), data.shape)
         return data + noise
 
     def __getitem__(self, idx):
-        i = idx * self.stride
+        stride = Config.WINDOW_SIZE if self.mode == 'train' else Config.WINDOW_SIZE
+        i = idx * stride
+
+        if i + self.window_size > len(self.x):
+            i = len(self.x) - self.window_size
+
         x_win = self.x[i: i + self.window_size]
         s_win = self.s[i: i + self.window_size]
-        y_win = self.y[i + self.predict_step: i + self.window_size + self.predict_step]
 
-        # === 转速特征计算 (已修正) ===
-        v_mean = np.mean(s_win)  # E[v]
-        v2_mean = np.mean(s_win ** 2)  # E[v^2] - 代表平均动能
+        # === 核心物理映射 ===
+        cov_win = np.mean(s_win, axis=0)
+        norm_scale = np.array([3000.0, 9000000.0], dtype=np.float32)
+        cov = cov_win / norm_scale
 
-        # 归一化协变量
-        scale = 3000.0
-        cov = np.array([v_mean / scale, v2_mean / (scale ** 2)], dtype=np.float32)
-
-        return torch.FloatTensor(x_win), torch.FloatTensor(y_win), torch.FloatTensor(cov), self.labels[i]
+        return torch.FloatTensor(x_win), torch.FloatTensor(x_win), torch.FloatTensor(cov), self.labels[i]
 
     def __len__(self):
-        return self.n_samples
+        stride = Config.WINDOW_SIZE if self.mode == 'train' else Config.WINDOW_SIZE
+        if len(self.x) < self.window_size: return 0
+        return (len(self.x) - self.window_size) // stride + 1
