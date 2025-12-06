@@ -71,7 +71,7 @@ class EdgeSentinel:
         x_feat = np.concatenate(feat_list, axis=1)
 
         # --- 2. Z-Score 标准化 ---
-        # x_feat = (x_feat - self.mean) / self.std
+        x_feat = (x_feat - self.mean) / self.std
 
         # 增加 Batch 维度 -> [1, Seq_Len, 21]
         x_feat = np.expand_dims(x_feat, axis=0).astype(np.float32)

@@ -9,9 +9,8 @@ from config import Config
 class MotorDataset(Dataset):
     def __init__(self, atoms_list, mode='train', fault_types=None, noise_snr=None):
         """
-        :param atoms_list: list of (Load, Speed) 这里的 Load/Speed 是物理值 (如 200, '15')
-        :param mode: 'train' (HH only), 'test' (HH + Faults)
-        :param noise_snr: float (dB) or None. 仅在测试模式生效。
+        :param atoms_list: list of (Load, Speed)
+        :param mode: 'train' or 'test'
         """
         self.window_size = Config.WINDOW_SIZE
         self.predict_step = Config.PREDICT_STEP
@@ -29,13 +28,48 @@ class MotorDataset(Dataset):
         # 2. 加载数据
         self.x, self.s, self.y, self.labels = self._load_data()
 
-        # 3. (已移除全局归一化，保持原始物理意义交给 RevIN)
-        pass
+        # 3. [核心修复] 全局 Z-Score 归一化
+        # 必须归一化！否则 Loss 降不下来，模型无法收敛
+        if self.mode == 'train':
+            self._fit_scaler(self.x)
+
+        self.x = self._apply_scaler(self.x)
+        # 自监督任务：Target 也就是 Input，也需要是归一化后的
+        self.y = self.x
 
         # 4. 计算长度
         self.stride = Config.STRIDE // Config.HOP_LENGTH if mode == 'train' else self.window_size
         self.n_samples = (len(self.x) - self.window_size - self.predict_step) // self.stride + 1
         if self.n_samples < 0: self.n_samples = 0
+
+    def _fit_scaler(self, data):
+        """计算并保存训练集的均值和方差"""
+        print("[Scaler] Fitting global scaler on training data...")
+        mean = np.mean(data, axis=0)
+        std = np.std(data, axis=0) + 1e-6  # 防止除零
+
+        # 确保目录存在
+        os.makedirs(os.path.dirname(Config.SCALER_PATH), exist_ok=True)
+
+        with open(Config.SCALER_PATH, 'wb') as f:
+            pickle.dump({'mean': mean, 'std': std}, f)
+
+        self.mean = mean
+        self.std = std
+        print(f"[Scaler] Saved to {Config.SCALER_PATH}")
+
+    def _apply_scaler(self, data):
+        """应用归一化"""
+        if not hasattr(self, 'mean'):
+            if os.path.exists(Config.SCALER_PATH):
+                with open(Config.SCALER_PATH, 'rb') as f:
+                    scaler = pickle.load(f)
+                self.mean = scaler['mean']
+                self.std = scaler['std']
+            else:
+                raise FileNotFoundError(f"Scaler not found at {Config.SCALER_PATH}, please run training first!")
+
+        return (data - self.mean) / self.std
 
     def _load_data(self):
         xs, ss, ys, ls = [], [], [], []
