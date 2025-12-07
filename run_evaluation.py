@@ -3,150 +3,121 @@ import torch
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
-from sklearn.metrics import roc_auc_score, f1_score
+# [新增] 引入更多指标
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, precision_score, recall_score, confusion_matrix
 
 from config import Config
 from data_loader import MotorDataset
 from utils.anomaly import InferenceEngine
-
-# [新增] 导入模型定义
 from models.rdlinear import RDLinear
 from models.baselines import LSTMAE, VanillaDLinear
 
 
 def get_model_instance(device):
-    """
-    模型工厂函数：根据配置动态实例化模型架构
-    """
     name = Config.MODEL_NAME
     if name == 'RDLinear':
         return RDLinear().to(device)
     elif name == 'DLinear':
         return VanillaDLinear(Config).to(device)
     elif name == 'LSTMAE':
-        # 确保输入维度与 Config 一致
         return LSTMAE(input_dim=Config.ENC_IN, hidden_dim=64).to(device)
     else:
         raise ValueError(f"Unknown Model Name: {name}")
 
 
 def run_evaluation_loop():
-    # 1. 准备环境
-    # 自动检测设备 (CPU/GPU)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_path = os.path.join(Config.OUTPUT_DIR, 'checkpoint.pth')
 
     print(f">>> Loading Model: {model_path}")
-    print(f"    Architecture: {Config.MODEL_NAME}")
-    print(f"    Device: {device}")
-
-    # 2. [核心修改] 动态实例化模型
-    # 之前是 model = RDLinear().to(device) -> 导致报错
     try:
         model = get_model_instance(device)
-        # 加载权重 (map_location 确保在 CPU 上也能加载 GPU 训练的权重)
         model.load_state_dict(torch.load(model_path, map_location=device))
     except Exception as e:
-        print(f"\n[Fatal Error] 模型权重加载失败！")
-        print(f"请检查 Config.MODEL_NAME ({Config.MODEL_NAME}) 是否与 checkpoint 内的权重匹配。")
-        print(f"错误详情: {e}")
+        print(f"[Fatal Error] {e}")
         return
 
-    # 初始化引擎 (自动加载 fusion_params.json)
     engine = InferenceEngine(model)
 
-    # 3. 获取测试配置
-    test_atoms = Config.TEST_ATOMS
-    # 这里的 fault_types 可以从 Config 获取，也可以默认
-    fault_types = Config.TEST_FAULT_TYPES
-    noise_snr = Config.TEST_NOISE_SNR
-
-    print(f">>> Test Config: Faults={fault_types}, Noise={noise_snr}dB")
-
+    # 结果容器
     results_summary = []
 
-    # 4. 循环测试
-    for phys_load, phys_speed in test_atoms:
-        # 构造实验名用于显示
-        exp_name = f"load_{phys_load}_speed_{phys_speed}"
-        if noise_snr is not None:
-            exp_name += f"_noise{noise_snr}dB"
+    # 加载阈值
+    th_path = os.path.join(Config.OUTPUT_DIR, 'threshold.npy')
+    if os.path.exists(th_path):
+        threshold = float(np.load(th_path))
+        print(f">>> Loaded Threshold: {threshold:.4f}")
+    else:
+        print(">>> [Warn] No threshold file found. Metrics requiring labels will be 0.")
+        threshold = None
 
-        save_dir = os.path.join(Config.OUTPUT_DIR, "eval_results", exp_name)
-        os.makedirs(save_dir, exist_ok=True)
+    for phys_load, phys_speed in Config.TEST_ATOMS:
+        exp_name = f"load_{phys_load}_speed_{phys_speed}"
+        if Config.TEST_NOISE_SNR: exp_name += f"_noise{Config.TEST_NOISE_SNR}dB"
 
         print(f"\n--- Running: {exp_name} ---")
 
         try:
-            # 实例化 Dataset
-            # 注意：传入的是单个工况的列表 [(load, speed)]
-            dataset = MotorDataset(
-                atoms_list=[(phys_load, phys_speed)],
-                mode='test',
-                fault_types=fault_types,
-                noise_snr=noise_snr
-            )
+            dataset = MotorDataset([(phys_load, phys_speed)], mode='test',
+                                   fault_types=Config.TEST_FAULT_TYPES,
+                                   noise_snr=Config.TEST_NOISE_SNR)
 
-            if len(dataset) == 0:
-                print(f"[Warn] No data found for {exp_name}. Skipping.")
-                continue
+            if len(dataset) == 0: continue
 
             dataloader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
-
-            # 推理
             scores, labels = engine.predict(dataloader)
 
-            # 指标计算
-            auc = 0.5
-            f1 = 0.0
-
-            # AUC 需要至少两类标签
-            if len(np.unique(labels)) < 2:
-                print("[Warn] Only one class present in labels. Cannot compute AUC.")
-            else:
-                auc = roc_auc_score(labels, scores)
-
-            # F1 需要阈值
-            th_path = os.path.join(Config.OUTPUT_DIR, 'threshold.npy')
-            if os.path.exists(th_path):
-                threshold = np.load(th_path)
-                preds = (scores > threshold).astype(int)
-                f1 = f1_score(labels, preds)
-            else:
-                print("[Warn] Threshold file not found. F1 is 0.0.")
-
-            print(f"   AUC: {auc:.4f} | F1: {f1:.4f}")
-
-            # 保存结果 (可选，如果你需要画详细图表)
-            np.save(os.path.join(save_dir, 'scores.npy'), scores)
-            np.save(os.path.join(save_dir, 'labels.npy'), labels)
-
-            results_summary.append({
+            # --- 核心指标计算 ---
+            metrics = {
                 'Experiment': exp_name,
-                'Model': Config.MODEL_NAME,  # 记录模型名
+                'Model': Config.MODEL_NAME,
                 'Load': phys_load,
                 'Speed': phys_speed,
-                'Noise': noise_snr,
-                'AUC': auc,
-                'F1': f1
-            })
+                'Noise': Config.TEST_NOISE_SNR,
+                'AUC': 0.0, 'Accuracy': 0.0, 'Precision': 0.0, 'Recall': 0.0, 'F1': 0.0
+            }
+
+            # 1. AUC (需要正负样本都存在)
+            if len(np.unique(labels)) > 1:
+                metrics['AUC'] = roc_auc_score(labels, scores)
+
+            # 2. Hard Metrics (需要阈值)
+            if threshold is not None:
+                preds = (scores > threshold).astype(int)
+                metrics['Accuracy'] = accuracy_score(labels, preds)
+                metrics['Precision'] = precision_score(labels, preds, zero_division=0)
+                metrics['Recall'] = recall_score(labels, preds, zero_division=0)
+                metrics['F1'] = f1_score(labels, preds, zero_division=0)
+
+                # 打印混淆矩阵信息
+                tn, fp, fn, tp = confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+                print(f"   [Confusion] TP:{tp} | FP:{fp} | TN:{tn} | FN:{fn}")
+
+            print(
+                f"   AUC: {metrics['AUC']:.4f} | F1: {metrics['F1']:.4f} | Prec: {metrics['Precision']:.4f} | Rec: {metrics['Recall']:.4f}")
+
+            results_summary.append(metrics)
 
         except Exception as e:
             print(f"[Error] {exp_name}: {e}")
-            import traceback
-            traceback.print_exc()
 
-    # 5. 保存报表 (支持追加模式)
+    # 保存到 CSV
     if results_summary:
         df = pd.DataFrame(results_summary)
-        csv_path = os.path.join(Config.OUTPUT_DIR, "eval_results", "summary_report.csv")
+        # 调整列顺序，好看一点
+        cols = ['Experiment', 'AUC', 'F1', 'Precision', 'Recall', 'Accuracy', 'Model', 'Load', 'Speed', 'Noise']
+        df = df[cols]
 
+        csv_path = os.path.join(Config.OUTPUT_DIR, "eval_results", "summary_report.csv")
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+        # 覆盖写入还是追加写入？建议覆盖本次运行的结果，或者带时间戳。这里演示追加
         if os.path.exists(csv_path):
             df.to_csv(csv_path, mode='a', header=False, index=False)
         else:
             df.to_csv(csv_path, mode='w', header=True, index=False)
 
-        print(f"\n>>> Done. Report updated: {csv_path}")
+        print(f"\n>>> Report Saved: {csv_path}")
 
 
 if __name__ == '__main__':

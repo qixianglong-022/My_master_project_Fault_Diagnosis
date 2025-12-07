@@ -70,7 +70,7 @@ class Config:
     # ================= 6. 数据处理参数 =================
     SAMPLE_RATE = 51200
     RAW_WINDOW_SIZE = 51200
-    FRAME_SIZE = 2048
+    FRAME_SIZE = 8192
     HOP_LENGTH = 1024
     WINDOW_SIZE = (RAW_WINDOW_SIZE - FRAME_SIZE) // HOP_LENGTH + 1
     STRIDE = RAW_WINDOW_SIZE
