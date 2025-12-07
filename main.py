@@ -161,7 +161,7 @@ def main():
     parser = argparse.ArgumentParser(description="RDLinear-AD 自动化实验台")
 
     # --- 核心控制 ---
-    parser.add_argument('--mode', type=str, default='train', choices=['preprocess', 'train', 'eval', 'all'])
+    parser.add_argument('--mode', type=str, default='all', choices=['preprocess', 'train', 'eval', 'all'])
     parser.add_argument('--exp_name', type=str, default=None, help='实验文件夹名(留空则自动生成)')
     parser.add_argument('--model_name', type=str, default=None,
                         choices=['RDLinear', 'DLinear', 'LSTMAE'],

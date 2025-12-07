@@ -59,9 +59,13 @@ class InferenceEngine:
         # 计算平方残差 [B, L, D]
         res_sq = (y_true - y_pred) ** 2
 
+        # return torch.mean(res_sq, dim=[1, 2])  # 强制使用 MSE
+
         # === 简单模式：如果没有融合参数，退化为 Mean SPE ===
         if self.fusion_params is None:
             return torch.mean(res_sq, dim=[1, 2])
+
+
 
         # === 高级模式：自适应融合 ===
         p = self.fusion_params
@@ -160,4 +164,7 @@ class InferenceEngine:
 
         # 保存参数而不是直接保存阈值
         np.save(os.path.join(Config.OUTPUT_DIR, 'threshold_params.npy'), threshold_params)
+        np.save(os.path.join(Config.OUTPUT_DIR, 'threshold.npy'), default_th)  # <--- 新增这一行
+
+        print(f"   Median={median:.4f}, MAD={mad:.4f} -> Default Th={default_th:.4f}")
         return default_th

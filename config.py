@@ -32,9 +32,9 @@ class Config:
     # 测试目标故障类型
     # 可以在这里显式指定要测试哪些故障，而不是默认 FB
     # 可选值对应 DATA_DOMAINS 的 Key: 'RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB'
-    # TEST_FAULT_TYPES = ['RU']
+    TEST_FAULT_TYPES = ['FB']
     # 全量测试
-    TEST_FAULT_TYPES = ['RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB']
+    # TEST_FAULT_TYPES = ['RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB']
     # 如果想同时测不平衡和轴承: TEST_FAULT_TYPES = ['RU', 'FB']
 
     # ================= 4. 物理通道与维度 =================
@@ -78,13 +78,13 @@ class Config:
 
     # ================= 7. 模型与训练 =================
     # 模型选择: 'RDLinear', 'DLinear', 'LSTM_AE','Informer', 'Autoformer', 'midruleDLinear', 'TiDE'
-    MODEL_NAME = 'RDLinear'
+    MODEL_NAME = 'LSTM_AE'
     BATCH_SIZE = 64
-    EPOCHS = 50
+    EPOCHS = 100
     LEARNING_RATE = 1e-3
 
     # 消融实验
-    USE_REVIN = False
+    USE_REVIN = True
     USE_SPEED = True
     # 噪声测试 (None 或 dB值)
     TEST_NOISE_SNR = None

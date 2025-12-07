@@ -118,8 +118,8 @@ def run_evaluation_loop():
             print(f"   AUC: {auc:.4f} | F1: {f1:.4f}")
 
             # 保存结果 (可选，如果你需要画详细图表)
-            # np.save(os.path.join(save_dir, 'scores.npy'), scores)
-            # np.save(os.path.join(save_dir, 'labels.npy'), labels)
+            np.save(os.path.join(save_dir, 'scores.npy'), scores)
+            np.save(os.path.join(save_dir, 'labels.npy'), labels)
 
             results_summary.append({
                 'Experiment': exp_name,
