@@ -163,7 +163,7 @@ def process_all():
                     # 论文公式 (3): 计算 E[v] 和 E[v^2]
                     v_mean = np.mean(segment)
                     v2_mean = np.mean(segment ** 2)
-                    speed_down.append(np.mean(speed_raw[s_idx:e_idx]))
+                    speed_down.append([v_mean, v2_mean])
 
                 # 再次对齐 (因为 speed 采样可能也会少一点)
                 real_len = len(speed_down)
