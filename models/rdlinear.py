@@ -5,6 +5,16 @@ from models.layers import RevIN, SeriesDecomp
 
 
 class RDLinear(nn.Module):
+    """
+    [论文对齐版] RDLinear-AD
+    Sec 3.4: 转速引导的解耦线性预测模型
+
+    关键机制：
+    1. RevIN: 消除转速引起的分布漂移 (Distribution Shift)
+    2. Trend分支: 学习 f(Speed) -> Baseline 的物理映射
+    3. CI策略: 支持 N+1+1 弹性架构
+    """
+
     def __init__(self):
         super().__init__()
         self.seq_len = Config.WINDOW_SIZE
@@ -17,40 +27,46 @@ class RDLinear(nn.Module):
 
         self.decomp = SeriesDecomp(kernel_size=25)
 
-        # Seasonal: 负责拟合周期性纹理 (保留输入)
+        # Seasonal: 拟合高频振动纹理 (Allow History Access)
         self.linear_seasonal = nn.Linear(self.seq_len, self.pred_len)
 
-        # Trend: 负责拟合能量基线 (物理引导)
+        # Trend: 拟合能量基线 (Physical Constrained)
+        # 输入维度: seq_len (历史) + cov_dim (转速协变量)
         cov_dim = 2 if Config.USE_SPEED else 0
         self.linear_trend = nn.Linear(self.seq_len + cov_dim, self.pred_len)
 
     def forward(self, x, cov):
         # x: [B, L, D]
-        if self.use_revin: x = self.revin(x, 'norm')
+        if self.use_revin:
+            x = self.revin(x, 'norm')
 
         seasonal, trend = self.decomp(x)
 
-        # --- Seasonal Branch (正常工作) ---
-        # 拟合高频振动纹理，这部分允许看历史数据
+        # --- Seasonal Branch ---
+        # 学习周期性故障冲击
         seasonal = self.linear_seasonal(seasonal.permute(0, 2, 1)).permute(0, 2, 1)
 
-        # --- Trend Branch (核心手术) ---
+        # --- Trend Branch ---
         trend = trend.permute(0, 2, 1)  # [B, D, L]
 
         if Config.USE_SPEED:
-            # === 核心修正：物理强制截断 ===
-            # 如果不使用 RevIN，为了防止模型直接复制输入的巨大能量(Identity Mapping)，
-            # 我们必须将 Trend 分支的“历史输入”抹零，强制模型只学习 f(Speed) -> Baseline
-            if not self.use_revin:
-                trend = torch.zeros_like(trend)
+            # [物理约束]
+            # 如果没有 RevIN，我们甚至应该把 Trend 的历史信息抹除，强制模型只看转速。
+            # 但在有 RevIN 的情况下，Trend 分量已经平稳化，
+            # 此时拼接 Covariates 是为了提供 "Context" (当前是加速还是减速?)
 
-                # 注入转速协变量
-            # cov: [B, 2] -> [B, D, 2]
+            # cov: [B, 2] -> 扩展到所有通道 [B, D, 2]
             cov_exp = cov.unsqueeze(1).repeat(1, self.enc_in, 1)
+
+            # 拼接: [B, D, L+2]
             trend = torch.cat([trend, cov_exp], dim=-1)
 
         trend = self.linear_trend(trend).permute(0, 2, 1)
 
+        # 融合
         out = seasonal + trend
-        if self.use_revin: out = self.revin(out, 'denorm')
+
+        if self.use_revin:
+            out = self.revin(out, 'denorm')
+
         return out

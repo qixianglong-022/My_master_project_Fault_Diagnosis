@@ -12,28 +12,12 @@ class FeatureExtractor:
         self.hop_length = config.HOP_LENGTH
         self.n_fft = self.frame_size
         self.window = np.hanning(self.frame_size)
-
-        # 1. 加载配置开关 (从 Config 中读取，提供默认值以防报错)
-        self.use_mfcc = getattr(config, 'USE_MFCC', True)
-        self.use_lfcc = getattr(config, 'USE_LFCC', False)
-
         self.n_mfcc = getattr(config, 'N_MFCC', 13)
-        self.n_lfcc = getattr(config, 'N_LFCC', 13)
-
-        # 滤波器数量 (通常 40 个滤波器足够)
         self.n_filters = 40
+        self.mel_fbank = self._create_filter_bank()
 
-        # 2. 预计算滤波器组 (根据开关决定是否计算)
-        self.mel_fbank = None
-        self.linear_fbank = None
 
-        if self.use_mfcc:
-            self.mel_fbank = self._create_filter_bank(mode='mel')
-
-        if self.use_lfcc:
-            self.linear_fbank = self._create_filter_bank(mode='linear')
-
-    def _create_filter_bank(self, mode):
+    def _create_filter_bank(self):
         """
         内部工具函数：根据模式生成 Mel 或 Linear 滤波器组
         """
@@ -42,16 +26,10 @@ class FeatureExtractor:
         n_fft = self.n_fft
         n_filters = self.n_filters
 
-        # A. 生成频点 (Frequency Points)
-        if mode == 'linear':
-            # === LFCC: 线性分布 (全频段均匀关注) ===
-            points = np.linspace(low_freq, high_freq, n_filters + 2)
-        else:
-            # === MFCC: 梅尔分布 (低频密集，高频稀疏) ===
-            low_mel = 2595 * np.log10(1 + low_freq / 700)
-            high_mel = 2595 * np.log10(1 + high_freq / 700)
-            mel_points = np.linspace(low_mel, high_mel, n_filters + 2)
-            points = 700 * (10 ** (mel_points / 2595) - 1)
+        low_mel = 2595 * np.log10(1 + low_freq / 700)
+        high_mel = 2595 * np.log10(1 + high_freq / 700)
+        mel_points = np.linspace(low_mel, high_mel, n_filters + 2)
+        points = 700 * (10 ** (mel_points / 2595) - 1)
 
         # B. 映射到 FFT Bin
         bin_points = np.floor((n_fft + 1) * points / self.sr).astype(int)
@@ -86,7 +64,7 @@ class FeatureExtractor:
         windowed_frames = frames * self.window
         mag_frames = np.abs(np.fft.rfft(windowed_frames, n=self.n_fft, axis=1))
         pow_frames = (mag_frames ** 2) / self.n_fft
-        return pow_frames
+        return pow_frames, mag_frames # 返回 mag 用于计算 SF
 
     def extract_vib_features(self, signal):
         """提取振动特征 (RMS + Kurtosis)"""
@@ -112,36 +90,33 @@ class FeatureExtractor:
 
     def extract_audio_features(self, signal):
         """
-        提取声纹特征 (无需传入 config，直接使用 self.config)
+        [论文对齐] 提取 MFCC(13) + Spectral Flatness(1) + High/Low Ratio(1)
         """
-        # 1. 计算 STFT 功率谱
-        pow_frames = self._compute_stft(signal)
-        # 兜底返回：如果信号太短无法分帧，返回全0
-        expected_dim = (self.n_mfcc if self.use_mfcc else 0) + (self.n_lfcc if self.use_lfcc else 0)
+        pow_frames, mag_frames = self._compute_stft(signal)
         if pow_frames is None:
-            return np.zeros((1, expected_dim))
+            return np.zeros((1, self.n_mfcc + 2))
 
-        features = []
+        # 1. MFCC
+        mel_spec = np.dot(pow_frames, self.mel_fbank.T)
+        mel_spec = np.where(mel_spec == 0, np.finfo(float).eps, mel_spec)
+        mel_spec = 10 * np.log10(mel_spec)
+        mfcc = dct(mel_spec, type=2, axis=1, norm='ortho')[:, 1:self.n_mfcc + 1]
 
-        # 分支 A: MFCC
-        if self.use_mfcc and self.mel_fbank is not None:
-            mel_spec = np.dot(pow_frames, self.mel_fbank.T)
-            mel_spec = np.where(mel_spec == 0, np.finfo(float).eps, mel_spec)  # 数值稳定
-            mel_spec = 10 * np.log10(mel_spec)
-            # 取 1~N+1 丢弃第0个能量系数
-            mfcc = dct(mel_spec, type=2, axis=1, norm='ortho')[:, 1:self.n_mfcc + 1]
-            features.append(mfcc)
+        # 2. Spectral Flatness (SF) = Geometric_Mean / Arithmetic_Mean
+        # 加上微小量防止 log(0)
+        mag_frames = mag_frames + 1e-10
+        gmean = np.exp(np.mean(np.log(mag_frames), axis=1))
+        amean = np.mean(mag_frames, axis=1)
+        sf = (gmean / amean).reshape(-1, 1)
 
-        # 分支 B: LFCC
-        if self.use_lfcc and self.linear_fbank is not None:
-            linear_spec = np.dot(pow_frames, self.linear_fbank.T)
-            linear_spec = np.where(linear_spec == 0, np.finfo(float).eps, linear_spec)
-            linear_spec = 10 * np.log10(linear_spec)
-            lfcc = dct(linear_spec, type=2, axis=1, norm='ortho')[:, 1:self.n_lfcc + 1]
-            features.append(lfcc)
+        # 3. Energy Ratio (High / Low)
+        # 简单定义：Low < 1kHz, High > 1kHz
+        # Index = Freq * N_FFT / SR
+        split_idx = int(1000 * self.n_fft / self.sr)
+        low_energy = np.sum(pow_frames[:, :split_idx], axis=1) + 1e-10
+        high_energy = np.sum(pow_frames[:, split_idx:], axis=1) + 1e-10
+        er = (high_energy / low_energy).reshape(-1, 1)
+        # 取对数压缩范围，使其分布更友好
+        er = np.log10(er)
 
-        # 拼接
-        if not features:
-            return np.zeros((pow_frames.shape[0], 0))
-
-        return np.concatenate(features, axis=1)
+        return np.concatenate([mfcc, sf, er], axis=1)

@@ -50,22 +50,28 @@ class Config:
 
     # ================= 5. 特征维度定义 =================
     USE_MFCC = True
-    USE_LFCC = True
+    USE_LFCC = False
 
-    N_MFCC = 20
-    N_LFCC = 20
+    # 声纹特征结构: [MFCC(13), Spectral_Flatness(1), Energy_Ratio(1)]
+    N_MFCC = 13
+    N_EXTRA_AUDIO = 2  # SF + EnergyRatio
 
-    # 计算总声纹维度：
-    _audio_dim = 0
-    if USE_MFCC: _audio_dim += N_MFCC
-    if USE_LFCC: _audio_dim += N_LFCC
-    FEAT_DIM_AUDIO = _audio_dim * len(COL_INDICES_AUDIO)
+    # 振动特征结构: [RMS(1), Kurtosis(1)]
+    N_VIB_FEAT = 2
 
-    # 振动: 2个特征 (RMS, Kurtosis) * 通道数
-    FEAT_DIM_VIB = 2 * len(COL_INDICES_VIB)  # 2 * 4 = 8
+    # 计算总维度
+    FEAT_DIM_AUDIO = (N_MFCC + N_EXTRA_AUDIO) * len([20])  # 假设1个声纹通道
+    FEAT_DIM_VIB = N_VIB_FEAT * len([8, 10, 11, 12])  # 4个振动通道
 
-    # 模型总输入维度 (enc_in) = 8 + 13 = 21
+    # 输入总维度
     ENC_IN = FEAT_DIM_VIB + FEAT_DIM_AUDIO
+
+    # [索引辅助] 用于 anomaly.py 快速定位
+    # 振动特征在 Tensor 中的范围: [0, FEAT_DIM_VIB)
+    # 声纹特征在 Tensor 中的范围: [FEAT_DIM_VIB, END)
+    # 其中声纹的 SF 特征位于声纹向量的第 13 位 (索引从0开始是13)
+    IDX_AUDIO_SF = 13
+    IDX_AUDIO_ER = 14
 
     # ================= 6. 数据处理参数 =================
     SAMPLE_RATE = 51200
