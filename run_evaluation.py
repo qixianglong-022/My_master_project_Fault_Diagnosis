@@ -65,6 +65,13 @@ def run_evaluation_loop():
             if len(dataset) == 0: continue
 
             dataloader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+
+            # === [新增] 调用可视化诊断 ===
+            # 创建保存目录: checkpoints/ExpName/vis_pdf/
+            vis_dir = os.path.join(Config.OUTPUT_DIR, "vis_pdf")
+            engine.diagnose(dataloader, save_dir=vis_dir, prefix=exp_name)
+            # ==========================
+
             scores, labels = engine.predict(dataloader)
 
             # --- 核心指标计算 ---

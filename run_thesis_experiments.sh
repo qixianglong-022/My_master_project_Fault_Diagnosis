@@ -1,70 +1,95 @@
 #!/bin/bash
 
-# 定义实验名称前缀
-EXP_PREFIX="Thesis_Final"
-# 强力建议：先训练一个通用的 Source Model，然后用它去测所有场景
-# 这样最节省时间，也能保证所有测试都是基于同一个模型权重
-SOURCE_EXP_NAME="${EXP_PREFIX}_Source_Model"
+# ==============================================================================
+# 硕士毕业论文最终实验自动化脚本 (Thesis Final Experiments)
+# 核心策略: RDLinear + No RevIN + 物理阻断 (Physics Constraint)
+# ==============================================================================
+
+# 1. 定义实验名称 (与代码中的修改对应)
+EXP_NAME="Thesis_Final_Physics_Constraint_LSTMAE"
+
+# 2. 核心参数配置
+# --ablation no_revin: 关键！禁用 RevIN，防止能量特征泄露
+# --model_name RDLinear: 使用修改过 Trend 分支的物理引导模型
+# COMMON_ARGS="--model_name RDLinear --ablation no_revin --batch_size 64"
+COMMON_ARGS="--model_name LSTMAE --batch_size 64"
+
+# Python 解释器 (防止多环境冲突)
+PYTHON="python"
 
 echo "========================================================"
 echo "   硕士毕业论文全流程实验自动化脚本"
-echo "   Source Domain: 200kg (15, 45, 15-45, 45-15)"
+echo "   Strategy: Physics-Constrained RDLinear (No-RevIN)"
+echo "   Experiment Name: ${EXP_NAME}"
 echo "========================================================"
 
 # --------------------------------------------------------
-# 第一步：训练源域模型 (既是 Baseline 的训练，也是所有迁移实验的母模型)
+# Step 1: 训练源域模型 (Training Phase)
+# Domain: 200kg (覆盖 15Hz, 45Hz, 加减速)
 # --------------------------------------------------------
 echo ""
-echo ">>> [Step 1] Training Source Model (Baseline)..."
-# 使用 'baseline' 场景进行训练，它会保存模型到 checkpoints/Thesis_Final_Source_Model
-python main.py --mode train \
-    --scenario baseline \
-    --exp_name ${SOURCE_EXP_NAME} \
-    --lr 0.001 --epochs 50 --batch_size 64
+echo ">>> [Step 1] Training Source Model (200kg)..."
+echo "    Log Dir: checkpoints/${EXP_NAME}"
 
+$PYTHON main.py --mode train \
+    --scenario baseline \
+    --exp_name ${EXP_NAME} \
+    --lr 0.001 --epochs 50 \
+    $COMMON_ARGS
+
+# 检查训练是否成功
 if [ $? -ne 0 ]; then
-    echo "Training failed! Exiting."
+    echo "[Error] Training failed! Please check the logs."
     exit 1
 fi
 
 # --------------------------------------------------------
-# 第二步：执行各项测试 (复用 Step 1 的模型)
-# 注意：我们使用 --mode eval，并指向同一个 --exp_name
-# 但我们通过切换 --scenario 来改变测试集！
-# (这就要求 main.py 在 eval 模式下也能正确加载 scenario 的 test_atoms)
+# Step 2: 评估 - 基础实验 (Evaluation - Baseline)
+# Domain: 200kg (Seen Conditions - 验证拟合能力)
 # --------------------------------------------------------
-
-# 2.1 基础实验测试 (200kg Seen)
 echo ""
-echo ">>> [Step 2.1] Testing Baseline (Seen Conditions)..."
-python main.py --mode eval \
+echo ">>> [Step 2.1] Evaluating Baseline (200kg Seen)..."
+$PYTHON main.py --mode eval \
     --scenario baseline \
-    --exp_name ${SOURCE_EXP_NAME}
+    --exp_name ${EXP_NAME} \
+    $COMMON_ARGS
 
-# 2.2 转速迁移测试 (200kg Unseen)
+# --------------------------------------------------------
+# Step 3: 评估 - 转速迁移 (Evaluation - Transfer Speed)
+# Domain: 200kg (Unseen Speeds: 30Hz, 60Hz, 30-60Hz...)
+# --------------------------------------------------------
 echo ""
-echo ">>> [Step 2.2] Testing Speed Transfer (200kg Unseen)..."
-python main.py --mode eval \
+echo ">>> [Step 2.2] Evaluating Speed Transfer (200kg Unseen)..."
+$PYTHON main.py --mode eval \
     --scenario transfer_speed \
-    --exp_name ${SOURCE_EXP_NAME}
+    --exp_name ${EXP_NAME} \
+    $COMMON_ARGS
 
-# 2.3 轻载迁移测试 (0kg All)
+# --------------------------------------------------------
+# Step 4: 评估 - 轻载迁移 (Evaluation - Load Transfer 0kg)
+# Domain: 0kg (All Speeds - 验证基线漂移适应性)
+# --------------------------------------------------------
 echo ""
-echo ">>> [Step 2.3] Testing Load Transfer (0kg)..."
-python main.py --mode eval \
+echo ">>> [Step 2.3] Evaluating Load Transfer (0kg)..."
+$PYTHON main.py --mode eval \
     --scenario transfer_load_0kg \
-    --exp_name ${SOURCE_EXP_NAME}
+    --exp_name ${EXP_NAME} \
+    $COMMON_ARGS
 
-# 2.4 重载迁移测试 (400kg All)
+# --------------------------------------------------------
+# Step 5: 评估 - 重载迁移 (Evaluation - Load Transfer 400kg)
+# Domain: 400kg (All Speeds - 验证高能基线适应性)
+# --------------------------------------------------------
 echo ""
-echo ">>> [Step 2.4] Testing Load Transfer (400kg)..."
-python main.py --mode eval \
+echo ">>> [Step 2.4] Evaluating Load Transfer (400kg)..."
+$PYTHON main.py --mode eval \
     --scenario transfer_load_400kg \
-    --exp_name ${SOURCE_EXP_NAME}
+    --exp_name ${EXP_NAME} \
+    $COMMON_ARGS
 
 echo ""
 echo "========================================================"
-echo "   所有实验完成！"
-echo "   结果汇总请查看: checkpoints/${SOURCE_EXP_NAME}/eval_results/summary_report.csv"
-echo "   (注意：report.csv 可能会被最后一次运行覆盖，建议每次跑完手动备份一下 csv，或者修改 run_evaluation 代码支持追加写入)"
+echo "   所有实验执行完毕！(All Done)"
+echo "   请查看汇总报表: checkpoints/${EXP_NAME}/eval_results/summary_report.csv"
+echo "   请查看可视化图: checkpoints/${EXP_NAME}/vis_pdf/"
 echo "========================================================"

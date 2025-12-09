@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import torch
 import numpy as np
 import os
@@ -174,6 +175,87 @@ class InferenceEngine:
         den = torch.sqrt(torch.sum(xm ** 2, dim=1) * torch.sum(ym ** 2, dim=1)) + 1e-8
 
         return num / den
+
+    def diagnose(self, data_loader, save_dir, prefix=""):
+        """
+        可视化诊断：抽取一个 Batch，画出 真实值 vs 重构值，保存为 PDF
+        """
+        self.model.eval()
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 1. 抽取一个 Batch
+        try:
+            # 尝试获取一个 batch
+            iter_dl = iter(data_loader)
+            x, y, cov, labels = next(iter_dl)
+        except StopIteration:
+            return
+
+        x = x.to(self.device)
+        y = y.to(self.device)
+        cov = cov.to(self.device)
+
+        with torch.no_grad():
+            pred = self.model(x, cov)
+
+        # 转为 numpy
+        y_np = y.cpu().numpy()
+        pred_np = pred.cpu().numpy()
+        cov_np = cov.cpu().numpy()
+        labels_np = labels.numpy()
+
+        # 2. 挑选样本进行绘图 (挑一个正常样本，挑一个故障样本)
+        indices_to_plot = []
+
+        # 找正常样本 (Label=0) 的第一个
+        normal_idxs = np.where(labels_np == 0)[0]
+        if len(normal_idxs) > 0:
+            indices_to_plot.append((normal_idxs[0], "Normal"))
+
+        # 找故障样本 (Label=1) 的第一个
+        fault_idxs = np.where(labels_np == 1)[0]
+        if len(fault_idxs) > 0:
+            indices_to_plot.append((fault_idxs[0], "Fault"))
+
+        # 如果没找到（比如全只有正常），就随便画前两个
+        if not indices_to_plot:
+            indices_to_plot = [(0, "Sample_0")]
+
+        # 3. 开始绘图
+        for idx, tag in indices_to_plot:
+            # 获取数据
+            # 振动通道 0 (假设索引0是振动)
+            vib_true = y_np[idx, :, 0]
+            vib_pred = pred_np[idx, :, 0]
+            # 转速 (Covariate) - 假设第0维是 Normalized Speed
+            speed_curve = cov_np[idx, 0]  # 这是一个标量，RDLinear里它是均值
+
+            # 创建画布
+            fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+            # 子图1: 重构对比
+            ax[0].plot(vib_true, label='True Signal', color='black', alpha=0.7, linewidth=1.5)
+            ax[0].plot(vib_pred, label='Reconstruction', color='red', linestyle='--', linewidth=1.5)
+            ax[0].set_title(f"[{tag}] Reconstruction Analysis (Speed Input: {speed_curve:.2f})", fontsize=12)
+            ax[0].legend()
+            ax[0].grid(True, alpha=0.3)
+
+            # 子图2: 残差 (SPE贡献)
+            residual = (vib_true - vib_pred) ** 2
+            ax[1].plot(residual, label='Squared Error', color='blue', alpha=0.6)
+            ax[1].set_title("Reconstruction Error (Residual)", fontsize=12)
+            ax[1].set_xlabel("Time Steps", fontsize=10)
+            ax[1].grid(True, alpha=0.3)
+            ax[1].legend()
+
+            plt.tight_layout()
+
+            # 4. 保存为 PDF
+            filename = f"{prefix}_{tag}_idx{idx}.pdf"
+            save_path = os.path.join(save_dir, filename)
+            plt.savefig(save_path, format='pdf', dpi=300)
+            plt.close(fig)
+            # print(f"   [Vis] Diagnosis plot saved: {save_path}")
 
     def fit_threshold(self, val_loader):
         # 这里的逻辑可以简化，主要目的是保存 param

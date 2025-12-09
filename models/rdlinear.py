@@ -58,10 +58,24 @@ class RDLinear(nn.Module):
             # cov: [B, 2] -> 扩展到所有通道 [B, D, 2]
             cov_exp = cov.unsqueeze(1).repeat(1, self.enc_in, 1)
 
-            # 拼接: [B, D, L+2]
-            trend = torch.cat([trend, cov_exp], dim=-1)
+            # # 拼接: [B, D, L+2]
+            # trend = torch.cat([trend, cov_exp], dim=-1)
 
-        trend = self.linear_trend(trend).permute(0, 2, 1)
+            # =========================================================
+            # [CRITICAL FIX] 物理阻断策略 (Physics-Constraint)
+            # 问题：线性模型会直接利用 trend 历史中的高幅值来预测未来，导致故障泄漏。
+            # 解决：强制抹除 trend 的历史信息，只保留 Speed 信息。
+            # 物理含义：Trend 基线只由当前工况 (Speed) 决定，与历史振动无关。
+            # =========================================================
+            trend_history = torch.zeros_like(trend)  # 全0掩码
+
+            # 拼接: [0, 0, ..., 0, Speed_Mean, Speed_Sq]
+            # 这样 Linear 层只能学到: Output = W * Speed + b
+            trend_input = torch.cat([trend_history, cov_exp], dim=-1)
+
+        # trend = self.linear_trend(trend).permute(0, 2, 1)
+        trend = self.linear_trend(trend_input).permute(0, 2, 1)
+
 
         # 融合
         out = seasonal + trend
