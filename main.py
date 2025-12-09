@@ -164,7 +164,7 @@ def main():
     parser.add_argument('--mode', type=str, default='all', choices=['preprocess', 'train', 'eval', 'all'])
     parser.add_argument('--exp_name', type=str, default=None, help='实验文件夹名(留空则自动生成)')
     parser.add_argument('--model_name', type=str, default=None,
-                        choices=['RDLinear', 'DLinear', 'LSTMAE'],
+                        choices=['RDLinear', 'DLinear', 'LSTMAE', 'TiDE', 'Transformer'],
                         help='选择模型架构')
 
     # --- 场景与消融 (The Elegant Part) ---

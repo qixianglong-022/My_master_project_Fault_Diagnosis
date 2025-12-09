@@ -32,9 +32,9 @@ class Config:
     # 测试目标故障类型
     # 可以在这里显式指定要测试哪些故障，而不是默认 FB
     # 可选值对应 DATA_DOMAINS 的 Key: 'RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB'
-    TEST_FAULT_TYPES = ['FB']
+    # TEST_FAULT_TYPES = ['FB']
     # 全量测试
-    # TEST_FAULT_TYPES = ['RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB']
+    TEST_FAULT_TYPES = ['RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB']
     # 如果想同时测不平衡和轴承: TEST_FAULT_TYPES = ['RU', 'FB']
 
     # ================= 4. 物理通道与维度 =================

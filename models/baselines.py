@@ -1,29 +1,22 @@
 # models/baselines.py
 import torch
 import torch.nn as nn
+import math
 from models.layers import SeriesDecomp
 
 
 class LSTMAE(nn.Module):
     """
-    LSTM Autoencoder (Baseline 1)
+    [Baseline 1] LSTM Autoencoder
     经典的基于重构的异常检测模型。
-    结构：Encoder (LSTM) -> Latent Vector (Last Hidden) -> Repeat -> Decoder (LSTM) -> Projection
-    特点：不具备解耦趋势的能力，也无法利用转速协变量。
     """
 
     def __init__(self, input_dim, hidden_dim=64, num_layers=2, dropout=0.1):
-        """
-        :param input_dim: 输入特征维度 (config.ENC_IN)
-        :param hidden_dim: LSTM 隐藏层维度
-        """
         super(LSTMAE, self).__init__()
-        self.enc_in = input_dim
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
+        self.enc_in = input_dim  # 兼容接口
 
-        # Encoder: [Batch, Seq, Dim] -> (h_n, c_n)
         self.encoder = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -31,9 +24,6 @@ class LSTMAE(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
-
-        # Decoder: [Batch, Seq, Hidden] -> [Batch, Seq, Hidden]
-        # 输入是重复后的 Latent Vector
         self.decoder = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
@@ -41,84 +31,157 @@ class LSTMAE(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
-
-        # Projection: [Batch, Seq, Hidden] -> [Batch, Seq, Dim]
         self.projection = nn.Linear(hidden_dim, input_dim)
 
     def forward(self, x, cov=None):
-        """
-        :param x: [Batch, Seq_Len, Channels]
-        :param cov: [Batch, Cov_Dim] (LSTMAE 无法使用协变量，此处仅为了兼容接口)
-        """
         batch_size, seq_len, _ = x.shape
-
-        # 1. Encode
-        # _, (h_n, _) = self.encoder(x)
-        # h_n shape: [num_layers, batch, hidden]
-        # 取最后一层的 hidden state 作为潜变量 z
         _, (h_n, _) = self.encoder(x)
         z = h_n[-1]  # [Batch, Hidden]
-
-        # 2. Repeat
-        # 将 z 在时间维度复制，作为 Decoder 的输入
-        # [Batch, Hidden] -> [Batch, Seq_Len, Hidden]
         decoder_input = z.unsqueeze(1).repeat(1, seq_len, 1)
-
-        # 3. Decode
         dec_out, _ = self.decoder(decoder_input)
-
-        # 4. Project
         recon = self.projection(dec_out)
-
         return recon
 
 
 class VanillaDLinear(nn.Module):
     """
-    Vanilla DLinear (Baseline 2)
-    原始 DLinear 模型 [Zeng et al., 2023]。
-    结构：Series Decomposition + Linear Layers (Trend & Seasonal)
-    区别于 RDLinear：
-    1. 没有 RevIN (无法处理非平稳分布漂移)。
-    2. Trend 分支不接受转速协变量 (无法解耦工况)。
+    [Baseline 2] Vanilla DLinear (无 RevIN, 无协变量)
     """
 
     def __init__(self, config):
         super(VanillaDLinear, self).__init__()
-
         self.seq_len = config.WINDOW_SIZE
-        self.pred_len = config.WINDOW_SIZE  # 重构任务
+        self.pred_len = config.WINDOW_SIZE
         self.enc_in = config.ENC_IN
 
-        # 分解模块
         self.decomp = SeriesDecomp(kernel_size=25)
-
-        # 线性层 (Channel Independence, 权重共享)
         self.seasonal_linear = nn.Linear(self.seq_len, self.pred_len)
-
-        # 注意：这里的 Trend 分支输入仅仅是 seq_len，没有 +2 (Speed Covariates)
         self.trend_linear = nn.Linear(self.seq_len, self.pred_len)
 
     def forward(self, x, cov=None):
-        """
-        :param x: [Batch, Seq_Len, Channels]
-        :param cov: 忽略，原始 DLinear 不处理协变量
-        """
-        # 1. 分解
+        # 忽略 cov
         seasonal_init, trend_init = self.decomp(x)
-
-        # 2. 维度变换 [B, L, D] -> [B, D, L]
         seasonal_init = seasonal_init.permute(0, 2, 1)
         trend_init = trend_init.permute(0, 2, 1)
 
-        # 3. 线性预测
         seasonal_output = self.seasonal_linear(seasonal_init)
         trend_output = self.trend_linear(trend_init)
 
-        # 4. 合成
         x_out = seasonal_output + trend_output
+        return x_out.permute(0, 2, 1)
 
-        # 5. 维度还原 [B, D, L] -> [B, L, D]
-        x_out = x_out.permute(0, 2, 1)
 
-        return x_out
+class TiDE(nn.Module):
+    """
+    [Baseline 3] TiDE (Time-series Dense Encoder)
+    谷歌提出的基于 MLP 的 SOTA 模型。
+    特点：显式利用协变量 (Covariates)，但核心是 MLP 而非 Linear。
+    用于对比：证明 Linear 在物理基线拟合上比 MLP 更鲁棒。
+    """
+
+    def __init__(self, config, hidden_dim=256, dropout=0.1):
+        super(TiDE, self).__init__()
+        self.seq_len = config.WINDOW_SIZE
+        self.pred_len = config.WINDOW_SIZE
+        self.enc_in = config.ENC_IN
+        self.cov_dim = 2 if config.USE_SPEED else 0  # Speed Mean & Speed Sq
+
+        # 1. Feature Projection
+        # 将历史序列展平 + 协变量
+        self.feature_dim = self.enc_in * self.seq_len + self.cov_dim
+
+        # 2. Encoder (MLP)
+        self.encoder = nn.Sequential(
+            nn.Linear(self.feature_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+
+        # 3. Decoder (MLP) -> 输出展平的序列
+        self.decoder = nn.Linear(hidden_dim, self.enc_in * self.pred_len)
+
+        # 4. Global Residual (类似 ResNet，帮助收敛)
+        self.global_residual = nn.Linear(self.seq_len, self.pred_len)
+
+    def forward(self, x, cov):
+        batch_size = x.shape[0]
+
+        # Flatten input: [B, L, D] -> [B, L*D]
+        x_flat = x.reshape(batch_size, -1)
+
+        # Concat Covariates: [B, L*D + Cov]
+        if self.cov_dim > 0:
+            encoder_input = torch.cat([x_flat, cov], dim=1)
+        else:
+            encoder_input = x_flat
+
+        # MLP Encoding
+        hidden = self.encoder(encoder_input)
+
+        # MLP Decoding
+        out_flat = self.decoder(hidden)
+        out = out_flat.reshape(batch_size, self.pred_len, self.enc_in)
+
+        # Global Residual (Channel Independent)
+        # 对每个通道独立做线性残差
+        res = self.global_residual(x.permute(0, 2, 1)).permute(0, 2, 1)
+
+        return out + res
+
+
+class TransformerBaseline(nn.Module):
+    """
+    [Baseline 4] Standard Transformer
+    代表 Informer/Autoformer 类模型。
+    用于对比：证明 Transformer 架构在机械信号上的过拟合与低效。
+    """
+
+    def __init__(self, config, d_model=64, nhead=4, num_layers=2, dropout=0.1):
+        super(TransformerBaseline, self).__init__()
+        self.enc_in = config.ENC_IN
+
+        # 1. Input Embedding
+        self.embedding = nn.Linear(self.enc_in, d_model)
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+
+        # 2. Transformer Encoder
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout,
+                                                    batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+
+        # 3. Output Projection
+        self.projection = nn.Linear(d_model, self.enc_in)
+
+    def forward(self, x, cov=None):
+        # x: [B, L, D]
+        # Embedding
+        x = self.embedding(x)  # [B, L, d_model]
+        x = self.pos_encoder(x)
+
+        # Transformer
+        x = self.transformer_encoder(x)
+
+        # Projection
+        out = self.projection(x)
+        return out
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)

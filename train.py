@@ -33,6 +33,12 @@ def get_model_instance(device):
     elif name == 'LSTMAE':
         # LSTMAE 需要输入维度和隐藏层维度
         return LSTMAE(input_dim=Config.ENC_IN, hidden_dim=64).to(device)
+    elif name == 'TiDE':
+        from models.baselines import TiDE
+        return TiDE(Config).to(device)
+    elif name == 'Transformer':  # 代表 Informer/Autoformer
+        from models.baselines import TransformerBaseline
+        return TransformerBaseline(Config).to(device)
     else:
         raise ValueError(f"Unknown Model Name: {name}")
 
