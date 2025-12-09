@@ -6,7 +6,7 @@
 # ==============================================================================
 
 # 1. 定义实验名称 (与代码中的修改对应)
-EXP_NAME="Thesis_Final_Physics_Constraint_AllFault_Transformer"
+EXP_NAME="Thesis_Final_Physics_Constraint_AllFault_TiDE"
 
 # 2. 核心参数配置
 # --ablation no_revin: 关键！禁用 RevIN，防止能量特征泄露
@@ -14,8 +14,8 @@ EXP_NAME="Thesis_Final_Physics_Constraint_AllFault_Transformer"
 # COMMON_ARGS="--model_name RDLinear --ablation no_revin --batch_size 64"
 # COMMON_ARGS="--model_name DLinear --batch_size 64"
 # COMMON_ARGS="--model_name LSTMAE --batch_size 64"
-# COMMON_ARGS="--model_name TiDE --batch_size 64"
-COMMON_ARGS="--model_name Transformer --batch_size 64"
+COMMON_ARGS="--model_name TiDE --batch_size 64"
+# COMMON_ARGS="--model_name Transformer --batch_size 64"
 
 # Python 解释器 (防止多环境冲突)
 PYTHON="python"
