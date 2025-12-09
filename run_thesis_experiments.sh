@@ -6,7 +6,7 @@ export PYTHONHASHSEED=42
 # ==============================================================================
 
 # 1. 定义实验名称 (与代码中的修改对应)
-EXP_NAME="Thesis_Final_Physics_Constraint_AllFault_RDLinear"
+EXP_NAME="Thesis_Final_Physics_Constraint_AllFault_RDLinear2"
 
 # 2. 核心参数配置
 # --ablation no_revin: 关键！禁用 RevIN，防止能量特征泄露

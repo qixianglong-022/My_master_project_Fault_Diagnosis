@@ -273,12 +273,35 @@ class InferenceEngine:
         eta = 4.0
         threshold = median + eta * mad
 
-        # 保存参数
-        os.makedirs(os.path.dirname(Config.OUTPUT_DIR), exist_ok=True)
-        # 这里顺便存一个 dummy fusion params 防止报错
-        params = {"note": "Automated logic used in anomaly.py"}
+        # 目标：保存 fusion_params.json，但绝不能破坏已有的参数
+
+        # 1. 定义一套“出厂设置”的默认参数
+        # (万一真的没有参数文件，用这个也能跑，不会报错)
+        final_params = {
+            'tau_base': 0.5,
+            'th_vib': 1.0,
+            'k1': 5.0,
+            'k2': 5.0
+        }
+
+        # 2. 尝试读取现有文件
+        if os.path.exists(Config.FUSION_PARAMS_PATH):
+            try:
+                with open(Config.FUSION_PARAMS_PATH, 'r') as f:
+                    existing_params = json.load(f)
+                    # 简单校验：如果包含关键key，就认为是有效文件，予以保留
+                    if 'tau_base' in existing_params:
+                        final_params = existing_params
+                        print(f"   [Config] Preserving existing fusion params.")
+                    else:
+                        print(f"   [Config] Existing params invalid, overwriting with defaults.")
+            except Exception as e:
+                print(f"   [Warn] Read fusion params failed ({e}), utilizing defaults.")
+
+        # 3. 写入文件 (确保文件存在且内容有效)
+        os.makedirs(os.path.dirname(Config.FUSION_PARAMS_PATH), exist_ok=True)
         with open(Config.FUSION_PARAMS_PATH, 'w') as f:
-            json.dump(params, f)
+            json.dump(final_params, f, indent=4)
 
         np.save(os.path.join(Config.OUTPUT_DIR, 'threshold.npy'), threshold)
         print(f"   [Done] Median={median:.4f}, MAD={mad:.4f} -> Th={threshold:.4f}")
