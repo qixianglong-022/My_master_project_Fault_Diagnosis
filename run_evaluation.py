@@ -20,7 +20,7 @@ def get_model_instance(device):
     elif name == 'DLinear':
         return VanillaDLinear(Config).to(device)
     elif name == 'LSTMAE':
-        return LSTMAE(input_dim=Config.ENC_IN, hidden_dim=64).to(device)
+        return LSTMAE(Config).to(device)
     elif name == 'TiDE':
         return TiDE(Config).to(device)
     elif name == 'Transformer':

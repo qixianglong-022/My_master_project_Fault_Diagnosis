@@ -12,7 +12,7 @@ import torch.nn as nn
 # 定义要测试的预测步长
 HORIZONS = [24, 48, 96, 192, 336]
 # 也可以对比 Transformer
-MODELS_TO_TEST = ['RDLinear', 'Transformer']
+MODELS_TO_TEST = ['RDLinear', 'Transformer','DLinear', 'LSTMAE', 'TiDE']
 
 
 def run_horizon_exp():

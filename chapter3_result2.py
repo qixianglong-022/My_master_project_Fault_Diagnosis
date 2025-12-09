@@ -1,57 +1,70 @@
 import matplotlib.pyplot as plt
-import numpy as np
+import pandas as pd
+import seaborn as sns
 
-# 设置风格
+# 设置学术风格
 plt.rcParams['font.family'] = 'DejaVu Sans'
 plt.rcParams['font.size'] = 12
 plt.rcParams['axes.linewidth'] = 1.5
 
-# 数据准备
-snr_levels = ['Clean', '10 dB', '5 dB', '0 dB', '-5 dB']
-x = np.arange(len(snr_levels))
+# 你的真实数据
+data = {
+    'Horizon': [24, 48, 96, 192, 336] * 5,
+    'MSE': [
+        # RDLinear
+        0.479, 0.505, 0.529, 0.583, 0.652,
+        # Transformer
+        0.432, 0.461, 0.480, 0.508, 0.565,
+        # DLinear
+        0.469, 0.490, 0.532, 0.574, 0.637,
+        # LSTMAE
+        0.486, 0.494, 0.503, 0.524, 0.577,
+        # TiDE
+        0.432, 0.472, 0.492, 0.512, 0.534
+    ],
+    'Model': ['RDLinear (Ours)']*5 + ['Transformer']*5 + ['DLinear']*5 + ['LSTMAE']*5 + ['TiDE']*5
+}
 
-# F1 Score 数据
-f1_adaptive = [0.9064, 0.8942, 0.8903, 0.9032, 0.8893]
-f1_direct =   [0.9224, 0.5343, 0.5038, 0.5294, 0.5158]
-f1_vib_only = [0.8772, 0.8772, 0.8772, 0.8772, 0.8772]
+df = pd.DataFrame(data)
 
-# Threshold 数据
-th_adaptive = [1.4173, 1.2108, 1.2903, 1.0742, 1.1804]
-th_direct =   [1.5616, 760.47, 2425.59, 7499.92, 24178.69]
+# 绘图
+plt.figure(figsize=(9, 6))
 
-# ==================== 图 1: F1 Score 鲁棒性对比 ====================
-plt.figure(figsize=(8, 6))
+# 定义颜色和线型（统一为填充标记）
+palette = {
+    'RDLinear (Ours)': '#d62728',  # 红色，突出
+    'Transformer': '#1f77b4',      # 蓝色
+    'TiDE': '#ff7f0e',             # 橙色
+    'LSTMAE': '#2ca02c',           # 绿色
+    'DLinear': '#7f7f7f'           # 灰色
+}
+markers = {
+    'RDLinear (Ours)': 'o',        # 圆圈（填充）
+    'Transformer': 's',            # 正方形（填充）
+    'TiDE': '^',                   # 三角形（填充）
+    'LSTMAE': 'D',                 # 菱形（填充）
+    'DLinear': 'p'                 # 五边形（填充，替换原来的'x'）
+}
 
-plt.plot(x, f1_adaptive, marker='o', linewidth=3, color='#d62728', label='Adaptive Fusion (Ours)')
-plt.plot(x, f1_direct, marker='s', linewidth=2, linestyle='--', color='#7f7f7f', label='Direct Fusion')
-plt.plot(x, f1_vib_only, marker='None', linewidth=2, linestyle=':', color='blue', label='Vibration Only Baseline')
+# 绘制折线图
+sns.lineplot(data=df, x='Horizon', y='MSE', hue='Model', style='Model',
+             palette=palette, markers=markers, markersize=9, linewidth=2.5)
 
-plt.xticks(x, snr_levels)
-plt.ylabel('F1-Score (Higher is Better)', fontsize=12)
-plt.xlabel('Noise Level (SNR)', fontsize=12)
-plt.title('Figure 4. Fault Detection Robustness under Acoustic Noise', fontsize=14)
-plt.ylim(0.4, 1.0)
+# 设置标题和标签
+plt.title('Figure 6. Long-term Forecasting Stability Analysis', fontsize=14, y=1.02)
+plt.xlabel('Prediction Horizon (H)', fontsize=12)
+plt.ylabel('Prediction MSE (Mean Squared Error)', fontsize=12)
 plt.grid(True, linestyle='--', alpha=0.5)
-plt.legend()
+
+# 添加标注箭头 (解释 Trade-off)
+plt.annotate('Fitting Accuracy (Waveform)', xy=(336, 0.534), xytext=(200, 0.45),
+             arrowprops=dict(facecolor='gray', shrink=0.05, alpha=0.5), fontsize=10, color='gray')
+plt.annotate('Physical Robustness (Baseline)', xy=(336, 0.652), xytext=(200, 0.70),
+             arrowprops=dict(facecolor='red', shrink=0.05, alpha=0.5), fontsize=10, color='#d62728')
+
+# 调整图例位置
+plt.legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0.)
 
 plt.tight_layout()
-plt.savefig('fig4_noise_robustness.pdf')
-plt.show()
-
-# ==================== 图 2: 阈值稳定性对比 (Log Scale) ====================
-plt.figure(figsize=(8, 6))
-
-plt.plot(x, th_adaptive, marker='o', linewidth=3, color='#d62728', label='Adaptive Fusion (Ours)')
-plt.plot(x, th_direct, marker='s', linewidth=2, linestyle='--', color='#7f7f7f', label='Direct Fusion')
-
-plt.xticks(x, snr_levels)
-plt.yscale('log')  # <--- 关键：对数坐标
-plt.ylabel('Decision Threshold (Log Scale)', fontsize=12)
-plt.xlabel('Noise Level (SNR)', fontsize=12)
-plt.title('Figure 5. Threshold Drift Analysis', fontsize=14)
-plt.grid(True, linestyle='--', alpha=0.5)
-plt.legend()
-
-plt.tight_layout()
-plt.savefig('fig5_threshold_stability.pdf')
+plt.savefig('fig6_horizon_stability.pdf', bbox_inches='tight')  # 添加bbox_inches避免图例被截断
 plt.show()
