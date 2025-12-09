@@ -121,6 +121,26 @@ def run_noise_exp_final():
 
     all_results = []
 
+    # 在 run_noise_exp_final 循环开始前，先跑一个 batch 的 clean data
+    print("\n>>> [DEBUG] Analyzing Magnitude...")
+    debug_loader = DataLoader(RobustMotorDataset(TEST_ATOMS_LIST, mode='test', noise_snr=None), batch_size=32)
+    x, y, cov, _ = next(iter(debug_loader))
+    x, y, cov = x.to(device), y.to(device), cov.to(device)
+    with torch.no_grad():
+        pred = model(x, cov)
+        res_sq = (y - pred) ** 2
+
+        # 振动部分残差
+        vib_dim = Config.FEAT_DIM_VIB
+        spe_vib = torch.mean(res_sq[:, :, :vib_dim]).item()
+
+        # 声纹部分残差
+        spe_audio = torch.mean(res_sq[:, :, vib_dim:]).item()
+
+        print(f"    Mean SPE Vibration: {spe_vib:.6f}")
+        print(f"    Mean SPE Audio    : {spe_audio:.6f}")
+        print(f"    Ratio (Vib/Audio) : {spe_vib / (spe_audio + 1e-8):.2f}")
+
     # 循环测试
     for snr in SNR_LEVELS:
         snr_label = str(snr) if snr is not None else "Clean"
@@ -142,28 +162,76 @@ def run_noise_exp_final():
     plot_paper_figure(df)
 
 
-def eval_safe(engine, dataloader, snr_label, method_name):
-    from sklearn.metrics import roc_auc_score, f1_score
-    scores, labels = engine.predict(dataloader)
-    scores = np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=0.0)
+def get_sliding_threshold_preds(scores, window_size=100, z=3.0):
+    """
+    [修正版] 带背景锁定机制的动态阈值
+    关键改进：当检测到异常时，停止更新滑动窗口，防止阈值被故障信号"同化"。
+    """
+    preds = []
+    thresholds = []
 
+    # 初始化缓冲区
+    history = list(scores[:window_size])
+
+    # 冷却计数器：防止一旦报警就永远不更新（死锁）
+    # 如果连续报警超过 max_freeze_steps，强制更新一次，适应新环境
+    freeze_counter = 0
+    MAX_FREEZE = 200
+
+    for score in scores:
+        # 1. 计算当前窗口统计量
+        median = np.median(history)
+        mad = np.median(np.abs(history - median))
+
+        # 2. 计算阈值 (z=3.0 是经验值，对应约 99.7% 的置信度)
+        th = median + z * (mad + 1e-6)
+
+        # 3. 判定
+        is_anomaly = score > th
+        preds.append(1 if is_anomaly else 0)
+        thresholds.append(th)
+
+        # 4. 智能更新策略 (Background Locking)
+        # 只有当样本是"正常"的，或者虽然异常但已经"冻结"太久了，才更新背景模型
+        if (not is_anomaly) or (freeze_counter > MAX_FREEZE):
+            history.pop(0)
+            history.append(score)
+            freeze_counter = 0  # 重置计数
+        else:
+            # 如果是异常，保持历史窗口不变（锁定背景），让阈值维持在低位
+            freeze_counter += 1
+
+    return np.array(preds), np.array(thresholds)
+
+
+def eval_safe(engine, dataloader, snr_label, method_name):
+    # ... (预测代码保持不变) ...
+    scores, labels = engine.predict(dataloader)
+    scores = np.nan_to_num(scores, nan=0.0)
+
+    # 切换为动态阈值 ===
+
+    # 使用滑动窗口生成动态预测
+    # window_size=100 (约2秒数据), z=3.5 (鲁棒系数)
+    preds, dynamic_ths = get_sliding_threshold_preds(scores, window_size=100, z=2.5)
+
+    # 计算指标
+    from sklearn.metrics import f1_score, roc_auc_score
     try:
         auc = roc_auc_score(labels, scores) if len(np.unique(labels)) > 1 else 0.5
     except:
         auc = 0.0
 
-    # 阈值加载
-    th_path = os.path.join(Config.OUTPUT_DIR, 'threshold.npy')
-    if os.path.exists(th_path):
-        th = float(np.load(th_path))
-    else:
-        th = np.median(scores) + 3 * np.median(np.abs(scores - np.median(scores)))
-
-    preds = (scores > th).astype(int)
     f1 = f1_score(labels, preds, zero_division=0)
 
-    return {"SNR_Label": snr_label, "Method": method_name, "AUC": auc, "F1": f1}
+    # 记录平均阈值，作为“抗噪代价”的证据
+    avg_th = np.mean(dynamic_ths)
 
+    # 打印一下，看看 Direct Fusion 是不是阈值飙升了
+    if snr_label in ['Clean', '-5', '-10', '10', '5', '0']:
+        print(f"    [Analysis] {method_name} ({snr_label}) Avg TH: {avg_th:.4f}")
+
+    return {"SNR_Label": snr_label, "Method": method_name, "AUC": auc, "F1": f1}
 
 def plot_paper_figure(df):
     try:
