@@ -88,6 +88,7 @@ class Config:
     BATCH_SIZE = 64
     EPOCHS = 100
     LEARNING_RATE = 1e-3
+    PRED_LEN = 0 # 预测步长，如果PRED_LEN = 0 或 None，则默认为重构任务 (Output Length = Window Size)
 
     # 消融实验
     USE_REVIN = True

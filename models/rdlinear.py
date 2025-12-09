@@ -18,7 +18,9 @@ class RDLinear(nn.Module):
     def __init__(self):
         super().__init__()
         self.seq_len = Config.WINDOW_SIZE
-        self.pred_len = Config.WINDOW_SIZE
+        # 获取预测长度，如果没设置或者是0，就等于输入长度
+        pred_len_cfg = getattr(Config, 'PRED_LEN', 0)
+        self.pred_len = pred_len_cfg if pred_len_cfg > 0 else Config.WINDOW_SIZE
         self.enc_in = Config.ENC_IN
 
         self.use_revin = Config.USE_REVIN

@@ -24,6 +24,10 @@ class MotorDataset(Dataset):
         # 3. 应用归一化
         self.x = self._apply_scaler(self.x)
 
+        # 4. 读取配置中的预测长度
+        self.pred_len = getattr(Config, 'PRED_LEN', 0)
+        # 如果是预测模式，滑动步长可能需要调整，这里暂时保持一致
+
     def _load_data(self, atoms_list):
         xs, ss, ls = [], [], []
 
@@ -116,20 +120,35 @@ class MotorDataset(Dataset):
         stride = Config.WINDOW_SIZE if self.mode == 'train' else Config.WINDOW_SIZE
         i = idx * stride
 
-        if i + self.window_size > len(self.x):
-            i = len(self.x) - self.window_size
+        # 边界检查需要考虑预测长度
+        total_len = self.window_size + (self.pred_len if self.pred_len > 0 else 0)
+        if i + total_len > len(self.x):
+            i = len(self.x) - total_len
 
+        # 输入窗口 (History)
         x_win = self.x[i: i + self.window_size]
         s_win = self.s[i: i + self.window_size]
 
-        # === 核心物理映射 ===
+        # 标签窗口 (Target)
+        if self.pred_len > 0:
+            # [预测模式] 标签是紧接着输入之后的 P 个点
+            y_win = self.x[i + self.window_size: i + self.window_size + self.pred_len]
+        else:
+            # [重构模式] 标签就是输入本身
+            y_win = x_win
+
+        # 协变量 (Speed)
+        # 注意：预测任务中，协变量通常需要知道“未来的转速”或“当前的转速”
+        # 这里为了简单且符合物理阻断逻辑，我们依然使用输入窗口的平均转速作为 Condition
         cov_win = np.mean(s_win, axis=0)
         norm_scale = np.array([3000.0, 9000000.0], dtype=np.float32)
         cov = cov_win / norm_scale
 
-        return torch.FloatTensor(x_win), torch.FloatTensor(x_win), torch.FloatTensor(cov), self.labels[i]
+        return torch.FloatTensor(x_win), torch.FloatTensor(y_win), torch.FloatTensor(cov), self.labels[i]
 
     def __len__(self):
-        stride = Config.WINDOW_SIZE if self.mode == 'train' else Config.WINDOW_SIZE
-        if len(self.x) < self.window_size: return 0
-        return (len(self.x) - self.window_size) // stride + 1
+        # 长度计算也要考虑 pred_len
+        total_len = self.window_size + (self.pred_len if self.pred_len > 0 else 0)
+        stride = Config.WINDOW_SIZE
+        if len(self.x) < total_len: return 0
+        return (len(self.x) - total_len) // stride + 1
