@@ -39,7 +39,8 @@ class MotorDataset(Dataset):
             # 否则加载所有 Config.DATA_DOMAINS 定义的类型
             target_faults = self.fault_types if self.fault_types else Config.TEST_FAULT_TYPES
             # 去重防止 HH 被加两次
-            domains = list(set(['HH'] + target_faults))
+            # 使用 sorted 确保加载顺序完全确定
+            domains = sorted(list(set(['HH'] + target_faults)))
 
         for domain in domains:
             # 简单标签: HH=0, 其他=1

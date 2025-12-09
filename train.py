@@ -130,9 +130,22 @@ def train_model():
     plot_weights(model, os.path.join(Config.OUTPUT_DIR, 'weight_heatmap.png'))  # 杀手级图示
 
     # Fit Threshold
+    # 重新加载 EarlyStopping 保存的最佳权重，确保阈值是基于最佳模型计算的
+    print(">>> Reloading Best Model for Threshold Fitting...")
+    ckpt_path = os.path.join(Config.OUTPUT_DIR, 'checkpoint.pth')
+    if os.path.exists(ckpt_path):
+        model.load_state_dict(torch.load(ckpt_path))
+    else:
+        print("[Warn] Checkpoint not found, using last model.")
+    # ==============================================
+
+    # Fit Threshold
+    # 使用 worker_init_fn 确保如果用了多进程也不会乱（虽然你现在是单进程）
     print(">>> Fitting Threshold...")
+
+    # 强制 shuffle=False
     eval_dl = DataLoader(train_ds, batch_size=Config.BATCH_SIZE, shuffle=False)
 
-    # InferenceEngine 内部会自动处理 device，因为它用了 next(model.parameters()).device
     engine = InferenceEngine(model)
+    # 注意：fit_threshold 内部会覆盖 fusion_params.json，请确认这是你想要的
     engine.fit_threshold(eval_dl)
