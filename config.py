@@ -91,7 +91,7 @@ class Config:
     PRED_LEN = 0 # 预测步长，如果PRED_LEN = 0 或 None，则默认为重构任务 (Output Length = Window Size)
 
     # 消融实验
-    USE_REVIN = True
+    USE_REVIN = False
     USE_SPEED = True
     # 噪声测试 (None 或 dB值)
     TEST_NOISE_SNR = None
