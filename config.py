@@ -1,5 +1,6 @@
 import os
 
+
 class Config:
     # ================= 1. 基础路径 =================
     PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
