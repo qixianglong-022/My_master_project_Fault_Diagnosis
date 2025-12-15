@@ -69,6 +69,43 @@ def read_raw_data(file_path):
         return None
 
 
+def compute_rpm_from_square_wave(signal, fs=51200, pulses_per_rev=1):
+    """
+    从方波信号中提取瞬时转速
+    :param signal: 方波电压数组
+    :param fs: 采样率 (你的 Config.SAMPLE_RATE)
+    :param pulses_per_rev: 一圈有几个脉冲 (假设凹槽只有一个，就是1)
+    :return: 该段信号对应的平均 RPM
+    """
+    # 1. 归一化并二值化 (消除噪声干扰)
+    # 假设高电平>4V，低电平<1V，取中间值做阈值
+    # 如果不知道具体电压，就用 max/min 的中间值
+    threshold = (np.max(signal) + np.min(signal)) / 2
+
+    # 生成 0/1 序列
+    binary_signal = (signal > threshold).astype(int)
+
+    # 2. 寻找上升沿 (从0变1的位置)
+    # diff = 1 代表上升沿，-1 代表下降沿
+    edges = np.diff(binary_signal)
+    rising_indices = np.where(edges == 1)[0]
+
+    # 3. 如果脉冲太少，无法计算转速 (比如信号丢失)
+    if len(rising_indices) < 2:
+        return 0.0  # 或者返回上一次的值
+
+    # 4. 计算相邻脉冲的时间差 (单位：点数)
+    intervals = np.diff(rising_indices)
+
+    # 5. 转为 RPM
+    # RPM = (Fs / 点数间隔) * 60 / 每圈脉冲数
+    # 为了鲁棒性，我们取这段窗口内所有周期的平均值
+    avg_interval = np.mean(intervals)
+
+    rpm = (fs / avg_interval) * 60 / pulses_per_rev
+
+    return rpm
+
 def process_all():
     print(f">>> Root Data Dir: {Config.DATA_ROOT}")
     print(f">>> Output Dir:    {Config.ATOMIC_DATA_DIR}")
@@ -160,9 +197,14 @@ def process_all():
                     e_idx = s_idx + Config.FRAME_SIZE
                     segment = speed_raw[s_idx:e_idx]
 
-                    # 论文公式 (3): 计算 E[v] 和 E[v^2]
-                    v_mean = np.mean(segment)
-                    v2_mean = np.mean(segment ** 2)
+                    current_rpm = compute_rpm_from_square_wave(segment, fs=Config.SAMPLE_RATE, pulses_per_rev=1)
+
+                    # E[v]: 转速的一阶矩
+                    v_mean = current_rpm
+
+                    # E[v^2]: 转速的二阶矩 (注意是 RPM 的平方，不是电压方波的平方)
+                    v2_mean = current_rpm ** 2
+
                     speed_down.append([v_mean, v2_mean])
 
                 # 再次对齐 (因为 speed 采样可能也会少一点)
