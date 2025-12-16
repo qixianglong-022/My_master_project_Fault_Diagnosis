@@ -84,7 +84,7 @@ class Config:
 
     # ================= 7. 模型与训练 =================
     # 模型选择: 'RDLinear', 'DLinear', 'LSTM_AE','Informer', 'Autoformer', 'midruleDLinear', 'TiDE'
-    MODEL_NAME = 'LSTM_AE'
+    MODEL_NAME = 'RDLinear'
     BATCH_SIZE = 64
     EPOCHS = 100
     LEARNING_RATE = 1e-3

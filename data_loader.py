@@ -31,28 +31,19 @@ class MotorDataset(Dataset):
     def _load_data(self, atoms_list):
         xs, ss, ls = [], [], []
 
-        # [修正] 恢复根据 fault_types 筛选数据的逻辑
+        # 逻辑恢复：根据 mode 决定加载哪些故障
         if self.mode == 'train':
             domains = ['HH']
         else:
-            # 如果指定了故障类型，就只加载 HH + 指定故障
-            # 否则加载所有 Config.DATA_DOMAINS 定义的类型
             target_faults = self.fault_types if self.fault_types else Config.TEST_FAULT_TYPES
-            # 去重防止 HH 被加两次
-            # 使用 sorted 确保加载顺序完全确定
             domains = sorted(list(set(['HH'] + target_faults)))
 
         for domain in domains:
-            # 简单标签: HH=0, 其他=1
             label = 0 if domain == 'HH' else 1
-
-            # 仅加载 atoms_list 中指定的工况
             for (load, speed) in atoms_list:
-                # 查表获取 ID
                 lid, sid = Config.LOAD_MAP.get(load), Config.SPEED_MAP.get(speed)
                 if not lid or not sid: continue
 
-                # 构建文件名
                 fn_x = f"{domain}_{lid}_{sid}.npy"
                 fn_s = f"{domain}_{lid}_{sid}_S.npy"
                 path_x = os.path.join(Config.ATOMIC_DATA_DIR, fn_x)
@@ -60,20 +51,29 @@ class MotorDataset(Dataset):
 
                 if os.path.exists(path_x) and os.path.exists(path_s):
                     x_data = np.load(path_x)
-                    s_data = np.load(path_s)  # Shape [L, 2]
+                    s_data = np.load(path_s)
 
-                    # 测试时注入噪声
+                    # === [核心热修复] ===
+                    # 如果发现转速数据长度是特征数据的2倍，说明被压扁了，立刻 reshape 回来
+                    if s_data.shape[0] == 2 * x_data.shape[0]:
+                        # print(f"Auto-fixing shape for {fn_s}: {s_data.shape} -> ({x_data.shape[0]}, 2)")
+                        s_data = s_data.reshape(-1, 2)
+                    # ===================
+
+                    # 长度对齐检查 (防止只有几帧的误差)
+                    min_len = min(len(x_data), len(s_data))
+                    x_data = x_data[:min_len]
+                    s_data = s_data[:min_len]
+
                     if self.mode == 'test' and self.noise_snr is not None:
                         x_data = self._add_noise(x_data, self.noise_snr)
 
                     xs.append(x_data)
                     ss.append(s_data)
-                    ls.append(np.ones(len(x_data)) * label)
+                    ls.append(np.ones(min_len) * label)
 
         if not xs:
-            # 打印当前尝试加载的路径，方便排查路径问题
             print(f"[Warn] No data loaded for atoms: {atoms_list}")
-            print(f"       Checked dir: {Config.ATOMIC_DATA_DIR}")
             return np.empty((0, Config.ENC_IN)), np.empty((0, 2)), []
 
         return np.concatenate(xs), np.concatenate(ss), np.concatenate(ls)
@@ -141,9 +141,25 @@ class MotorDataset(Dataset):
         # 协变量 (Speed)
         # 注意：预测任务中，协变量通常需要知道“未来的转速”或“当前的转速”
         # 这里为了简单且符合物理阻断逻辑，我们依然使用输入窗口的平均转速作为 Condition
-        cov_win = np.mean(s_win, axis=0)
-        norm_scale = np.array([3000.0, 9000000.0], dtype=np.float32)
-        cov = cov_win / norm_scale
+        # cov_win = np.mean(s_win, axis=0)
+        # norm_scale = np.array([3000.0, 9000000.0], dtype=np.float32)
+        # cov = cov_win / norm_scale
+
+        # [修改后] 计算 Start, End, Mean
+        v_start = s_win[0, 0]
+        v_end = s_win[-1, 0]
+        v_mean = np.mean(s_win[:, 0])
+        v2_mean = np.mean(s_win[:, 1])
+
+        # 归一化 (根据你的 3000 rpm)
+        norm = 3000.0
+        # 构造 3 维协变量: [Mean, Mean_Square, Slope_Indicator]
+        # Slope_Indicator = (End - Start)
+        cov = np.array([
+            v_mean / norm,
+            v2_mean / (norm ** 2),
+            (v_end - v_start) / norm
+        ], dtype=np.float32)
 
         return torch.FloatTensor(x_win), torch.FloatTensor(y_win), torch.FloatTensor(cov), self.labels[i]
 

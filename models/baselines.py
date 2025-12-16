@@ -123,7 +123,7 @@ class TiDE(nn.Module):
         self.pred_len = pred_len_cfg if pred_len_cfg > 0 else config.WINDOW_SIZE
 
         self.enc_in = config.ENC_IN
-        self.cov_dim = 2 if config.USE_SPEED else 0
+        self.cov_dim = 3 if config.USE_SPEED else 0
 
         # 1. Feature Projection
         self.feature_dim = self.enc_in * self.seq_len + self.cov_dim

@@ -38,7 +38,7 @@ class RDLinear(nn.Module):
         # 4. Trend 分支: 拟合低频基线 (物理引导核心)
         # 输入维度: seq_len (历史趋势) + cov_dim (转速协变量)
         # 我们将转速拼接到时间维度上，让模型同时看到 "过去的趋势" 和 "当前的工况"
-        cov_dim = 2 if Config.USE_SPEED else 0  # Speed Mean, Speed Sq
+        cov_dim = 3 if Config.USE_SPEED else 0  # Speed Mean, Speed Sq
         self.linear_trend = nn.Linear(self.seq_len + cov_dim, self.pred_len)
 
     def forward(self, x, cov):
@@ -71,10 +71,12 @@ class RDLinear(nn.Module):
             cov_exp = cov.unsqueeze(1).repeat(1, self.enc_in, 1)
 
             # 2. [CRITICAL FIX] 拼接历史趋势与物理工况
-            # 之前错误做法: trend_history = torch.zeros_like(trend) (导致 Recall=0)
+            # 物理截断:
+            dummy_trend = torch.zeros_like(trend)
+            trend_input = torch.cat([dummy_trend, cov_exp], dim=-1)
             # 正确做法: 直接拼接，保留历史信息，由线性层权重决定依赖程度
-            trend_input = torch.cat([trend, cov_exp], dim=-1)
-            # trend_input shape: [Batch, D, Seq_Len + 2]
+            # trend_input = torch.cat([trend, cov_exp], dim=-1)
+
         else:
             # 无物理引导，仅使用历史趋势
             trend_input = trend
