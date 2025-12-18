@@ -11,7 +11,19 @@ import matplotlib.font_manager as fm
 
 # === 1. 全局配置 ===
 def set_style():
-    plt.style.use('seaborn-v0_8-whitegrid')
+    # [修复] 增加样式兼容性处理
+    try:
+        # 尝试使用新版样式
+        plt.style.use('seaborn-v0_8-whitegrid')
+    except (OSError, FileNotFoundError):
+        try:
+            # 回退到旧版样式
+            plt.style.use('seaborn-whitegrid')
+        except (OSError, FileNotFoundError):
+            # 如果都失败，使用默认样式
+            plt.style.use('seaborn')
+
+    # 字体配置 (保持原逻辑)
     font_candidates = [r'C:\Windows\Fonts\simhei.ttf', r'/System/Library/Fonts/PingFang.ttc']
     font_prop = None
     for f in font_candidates:
@@ -21,7 +33,6 @@ def set_style():
             plt.rcParams['axes.unicode_minus'] = False
             break
     return font_prop
-
 
 FONT_PROP = set_style()
 CLASS_NAMES = ['HH', 'RU', 'RM', 'SW', 'VU', 'BR', 'KA', 'FB']
@@ -35,26 +46,53 @@ DOMAIN_COLORS = {
 
 
 def extract_features(model, loader, device):
-    """提取特征通用函数"""
+    """提取特征通用函数 (适配 Ablation 实验)"""
     model.eval()
     feats, preds, labs, loads = [], [], [], []
 
     with torch.no_grad():
-        for micro_x, speed, y_cls, y_load in loader:
+        for micro_x, macro_x, speed, y_cls, y_load in loader:
             micro_x = micro_x.to(device)
+            macro_x = macro_x.to(device)
             speed = speed.to(device)
 
-            # 复现前向过程
-            x = model.revin(micro_x, 'norm')
-            seasonal, trend = model.decomp(x)
-            seasonal_guided = model.pgfa(seasonal, speed)
-            t_feat = model.linear_trend(trend.squeeze(-1))
-            s_feat = model.linear_seasonal(seasonal_guided.squeeze(-1))
+            # --- [核心修改] 复现 PhysRDLinear 的 Forward 逻辑 ---
+            # 必须判断当前模型是否有对应的模块 (适配消融实验)
 
-            # 融合特征
-            fusion = torch.cat([t_feat, s_feat], dim=1)
+            # 1. Stream 1: Micro
+            if hasattr(model, 'revin_micro'):
+                x1 = model.revin_micro(micro_x, 'norm')
+                sea, trend = model.decomp(x1)
 
-            logits, _ = model(micro_x, speed)
+                # [Fix] 检查是否存在 pgfa 模块
+                if hasattr(model, 'pgfa') and model.pgfa is not None:
+                    sea_guided = model.pgfa(sea, speed)
+                else:
+                    sea_guided = sea  # 没有 PGFA 就直通
+
+                f_trend = model.lin_trend(trend.squeeze(-1))
+                f_sea = model.lin_sea(sea_guided.squeeze(-1))
+
+                # 2. Stream 2: Macro
+                x2 = model.revin_macro(macro_x, 'norm')
+                f_macro = model.lin_macro(x2.squeeze(-1))
+
+                # Fusion Feature
+                fusion = torch.cat([f_trend, f_sea, f_macro], dim=1)
+
+                # Logits
+                logits = model.cls_head(fusion)
+
+            else:
+                # 兼容基线模型 (如果以后要用这个函数跑 ResNet 的特征提取)
+                # 基线模型没有 decomp/revin 等结构，直接取倒数第二层比较麻烦
+                # 这里简单处理：直接 forward 拿 logits，特征暂不可用
+                # 或者针对特定基线写特定逻辑。
+                # 针对 RQ3，我们只跑 PhysRDLinear 家族，上面的 if 分支就够了。
+                full_x = torch.cat([micro_x, macro_x], dim=1)
+                logits, _ = model(full_x, speed)
+                fusion = torch.zeros(logits.size(0), 1)  # 占位符
+
             preds_batch = torch.argmax(logits, dim=1)
 
             feats.append(fusion.cpu().numpy())

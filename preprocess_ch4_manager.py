@@ -15,7 +15,10 @@ class CH4DualStreamProcessor:
     def __init__(self):
         # 物理参数定义
         self.original_fs = Config.SAMPLE_RATE  # 51200 Hz
-        self.decimation_factor = 10  # 10倍降采样
+        # [核心修复] 降采样倍数由 10 改为 50
+        # 物理含义: 51200 / 50 = 1024 Hz
+        # FFT分辨率: 1024 Hz / 1024 points = 1 Hz (显微镜级别!)
+        self.decimation_factor = 50
         self.target_fs = self.original_fs / self.decimation_factor
 
         self.fft_points = 1024  # 统一FFT点数

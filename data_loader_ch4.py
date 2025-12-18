@@ -9,10 +9,8 @@ from config import Ch4Config
 
 class Ch4DualStreamDataset(Dataset):
     """
-    第四章专用：严格遵循域泛化协议的数据加载器
+    第四章专用：双流多分辨率数据加载器
     """
-
-    # [关键修复] 这里增加了 config 参数，匹配 main_ch4 的调用
     def __init__(self, config: Ch4Config, mode: str = 'train'):
         self.config = config
         self.data_dir = config.DATA_DIR
@@ -74,23 +72,28 @@ class Ch4DualStreamDataset(Dataset):
 
     def __getitem__(self, idx):
         path = os.path.join(self.data_dir, self.samples[idx])
+        # data keys: ['micro', 'panorama', 'speed', 'load']
         data = np.load(path, allow_pickle=True).item()
 
-        # 1. 输入: 显微流频谱
+        # 1. 显微流 (Micro-Stream): [512, 1] -> 物理分辨率高，关注低频
         micro_x = torch.FloatTensor(data['micro']).unsqueeze(-1)
 
-        # 2. 协变量: 实时转速 (Hz)
+        # 2. [新增] 全景流 (Macro-Stream): [512, 1] -> 带宽大，关注高频
+        macro_x = torch.FloatTensor(data['panorama']).unsqueeze(-1)
+
+        # 3. 协变量: 实时转速 (Hz)
         speed_hz = torch.FloatTensor([data['speed'] / 60.0])
 
-        # 3. 标签: 故障类别
+        # 4. 标签: 故障类别
         fname = self.samples[idx]
         domain = fname.split('_')[0]
         target_cls = torch.tensor(self.cls_map.get(domain, 0), dtype=torch.long)
 
-        # 4. 标签: 物理负载 (归一化, 用于回归)
+        # 5. 标签: 物理负载 (归一化, 用于回归)
         target_load = torch.FloatTensor([data['load'] / 400.0])
 
-        return micro_x, speed_hz, target_cls, target_load
+        # 返回双流数据
+        return micro_x, macro_x, speed_hz, target_cls, target_load
 
     def __len__(self):
         return len(self.samples)
