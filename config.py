@@ -107,3 +107,22 @@ class Config:
         'KA': '第7组——电机健康状态：转子条断裂故障（KA）',
         'FB': '第8组——电机健康状态：轴承故障（FB）',
     }
+
+    # ================= 第四章专用：诊断实验配置 =================
+    CH4_MODE = True  # 激活第四章模式
+    CH4_EPOCHS = 50  # 诊断任务收敛快，50轮足够
+    NUM_CLASSES = 8  # 8种健康状态分类
+
+    # 多分辨率物理参数
+    MICRO_FS = 5120.0  # 显微流采样率 (10倍降采样)
+    PANORAMA_FS = 51200.0  # 全景流采样率
+    FREQ_SIGMA = 10.0  # PGFA 高斯方差 (物理容错带宽)
+
+    # 域泛化设置 (Leave-One-Domain-Out)
+    # 训练使用 0kg 和 400kg，测试使用 200kg 验证泛化性
+    CH4_TRAIN_LOADS = [0, 400]
+    CH4_TEST_LOADS = [200]
+
+    # 任务权重初始化 (MTL)
+    INIT_LOG_VAR_CLS = 0.0
+    INIT_LOG_VAR_REG = 5.0  # 初始给回归任务较小权重，优先保证分类收敛
