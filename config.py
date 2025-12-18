@@ -1,4 +1,6 @@
 import os
+from dataclasses import dataclass, field
+from typing import List
 
 
 class Config:
@@ -108,21 +110,54 @@ class Config:
         'FB': '第8组——电机健康状态：轴承故障（FB）',
     }
 
-    # ================= 第四章专用：诊断实验配置 =================
-    CH4_MODE = True  # 激活第四章模式
-    CH4_EPOCHS = 50  # 诊断任务收敛快，50轮足够
-    NUM_CLASSES = 8  # 8种健康状态分类
+# ================= Chapter 4 Dedicated Config (第四章专用配置) =================
+@dataclass
+class Ch4Config:
+    """第四章：变工况域泛化实验专用配置"""
 
-    # 多分辨率物理参数
-    MICRO_FS = 5120.0  # 显微流采样率 (10倍降采样)
-    PANORAMA_FS = 51200.0  # 全景流采样率
-    FREQ_SIGMA = 10.0  # PGFA 高斯方差 (物理容错带宽)
+    # --- 1. 基础路径 (继承自 BasePaths) ---
+    PROJECT_ROOT: str = Config.PROJECT_ROOT
+    DATA_DIR: str = os.path.join(PROJECT_ROOT, "processed_data_ch4_dual_stream")
+    CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints_ch4")
 
-    # 域泛化设置 (Leave-One-Domain-Out)
-    # 训练使用 0kg 和 400kg，测试使用 200kg 验证泛化性
-    CH4_TRAIN_LOADS = [0, 400]
-    CH4_TEST_LOADS = [200]
+    # --- 2. 物理参数 ---
+    FREQ_DIM: int = 512  # 显微流 FFT点数 / 2
+    NUM_CLASSES: int = 8  # 1 正常 + 7 故障
+    SAMPLE_RATE: int = 5120  # 显微流采样率
 
-    # 任务权重初始化 (MTL)
-    INIT_LOG_VAR_CLS = 0.0
-    INIT_LOG_VAR_REG = 5.0  # 初始给回归任务较小权重，优先保证分类收敛
+    # --- 3. 模型超参 ---
+    HIDDEN_DIM: int = 128
+    PGFA_SIGMA: float = 3.0  # PGFA 高斯掩码带宽
+
+    # --- 4. 训练参数 ---
+    BATCH_SIZE: int = 16
+    EPOCHS: int = 100
+    LEARNING_RATE: float = 1e-3
+    SEED: int = 42
+
+    # --- 5. 实验协议 (Domain Generalization Protocol) ---
+    # 核心逻辑：源域训练，目标域测试
+
+    # 源域 (Train): 仅使用 200kg (半载)
+    # 转速: 仅覆盖 4 种基础转速 (15, 45, 15-45, 45-15)
+    TRAIN_LOADS: List[int] = field(default_factory=lambda: [200])
+    TRAIN_SPEEDS: List[str] = field(default_factory=lambda: ['15', '45', '15-45', '45-15'])
+
+    # 目标域 (Test): 使用 0kg (空载) 和 400kg (满载)
+    # 转速: 外推至全量 8 种转速 (包含未见的 30Hz, 60Hz 及其瞬态)
+    TEST_LOADS: List[int] = field(default_factory=lambda: [0, 400])
+    TEST_SPEEDS: List[str] = field(default_factory=lambda: [
+        '15', '30', '45', '60',
+        '15-45', '30-60', '45-15', '60-30'
+    ])
+
+    # 映射表 (文件名 ID -> 物理含义)
+    # Load: 0->0, 2->200, 4->400
+    # Speed: 1->15, 2->30, 3->45, 4->60 ...
+    SPEED_ID_MAP = {
+        '1': '15', '2': '30', '3': '45', '4': '60',
+        '5': '15-45', '6': '30-60', '7': '45-15', '8': '60-30'
+    }
+
+    def __post_init__(self):
+        os.makedirs(self.CHECKPOINT_DIR, exist_ok=True)

@@ -1,81 +1,128 @@
+# main_ch4.py
 import torch
-import pandas as pd
+import argparse
+import os
 from torch.utils.data import DataLoader
-from models.phys_rdlinear_cls import PhysRDLinearCls
-from utils.loss_ch4 import MultiTaskLoss
+
+# 引入合并后的配置
+from config import Ch4Config
 from data_loader_ch4 import Ch4DualStreamDataset
-from config import Config
+# 确保这里引入的是重构后的模型文件
+from models.phys_rdlinear import PhysRDLinearCls
+from utils.uncertainty_loss import UncertaintyLoss
+from utils.tools import set_seed
+from trainer import Trainer
+from utils.visualization import run_visualization_pipeline
 
-# ==============================================================================
-# 1. 实验场景注册表 (SCENARIO REGISTRY) - 论文实验设计专用
-# ==============================================================================
-
-# 定义通用的训练集：200kg 下的 4 种典型工况 (覆盖低速、高速、加速、减速)
-# Source Domain: Load 200kg
-SOURCE_TRAIN_ATOMS = [
-    (200, '15'), (200, '45'), (200, '15-45'), (200, '45-15')
-]
-
-# 定义所有 8 种工况的列表 (用于全工况测试)
-ALL_SPEED_ATOMS_CODES = [
-    '15', '30', '45', '60',       # 稳态
-    '15-45', '30-60', '45-15', '60-30' # 变态
-]
-
-# main.py 中的场景注册表更新
-SCENARIOS = {
-    'challenge_transfer': {
-        'description': '高难度迁移: 200kg(源域)训练 -> 0kg/400kg(目标域)泛化',
-        'train_atoms': [(200, '15'), (200, '45'), (200, '15-45'), (200, '45-15')],
-        'test_atoms':  [(0, s) for s in ALL_SPEED_ATOMS_CODES] + [(400, s) for s in ALL_SPEED_ATOMS_CODES]
-    }
-}
 
 def run_ch4_experiment():
+    # 1. 参数解析
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'eval'])
+    args = parser.parse_args()
+
+    # 2. 初始化配置 (直接实例化)
+    config = Ch4Config()
+
+    # 3. 环境与随机种子
+    set_seed(config.SEED)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f">>> [Chapter 4] Starting Leave-One-Domain-Out Experiment on {device}")
 
-    # 1. 准备数据
-    train_loader = DataLoader(Ch4DualStreamDataset(mode='train'), batch_size=Config.BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(Ch4DualStreamDataset(mode='test'), batch_size=Config.BATCH_SIZE, shuffle=False)
+    print(f"==================================================")
+    print(f">>> [Chapter 4] Experiment: Single Source DG")
+    print(f"    Device: {device}")
+    print(f"    TRAIN (Source): Load {config.TRAIN_LOADS} | Speeds: {len(config.TRAIN_SPEEDS)} types")
+    print(f"    TEST  (Target): Load {config.TEST_LOADS} | Speeds: {len(config.TEST_SPEEDS)} types (Extrapolated)")
+    print(f"==================================================")
 
-    # 2. 初始化 Phys-RDLinear
-    model = PhysRDLinearCls(num_classes=Config.NUM_CLASSES, freq_dim=512).to(device)
-    mtl_loss = MultiTaskLoss().to(device)
+    # 4. 准备数据
+    # 现在 Ch4DualStreamDataset 可以正确接收 config 参数了
+    train_ds = Ch4DualStreamDataset(config, mode='train')
+    test_ds = Ch4DualStreamDataset(config, mode='test')
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
 
-    # 3. 自动化训练循环
-    for epoch in range(Config.CH4_EPOCHS):
-        model.train()
-        for micro_x, speed, y_cls, y_load in train_loader:
-            micro_x, speed, y_cls, y_load = micro_x.to(device), speed.to(device), y_cls.to(device), y_load.to(device)
+    print(f">>> Samples: Train={len(train_ds)}, Test={len(test_ds)}")
 
-            optimizer.zero_grad()
-            logits, pred_load = model(micro_x, speed)
-            loss, l_cls, l_reg = mtl_loss(logits, y_cls, pred_load, y_load)
-            loss.backward()
-            optimizer.step()
+    # 5. 模型与训练器
+    model = PhysRDLinearCls(config).to(device)
+    trainer = Trainer(config, model, device)
 
-        # 4. 自动化未见域测试 (实事求是验证泛化性)
-        if (epoch + 1) % 10 == 0:
-            acc = evaluate_unseen_domain(model, test_loader, device)
-            print(f"Epoch {epoch + 1} | Unseen Domain (200kg) Acc: {acc:.2f}% | Cls_Loss: {l_cls:.4f}")
+    # 6. 执行流程
+    if args.mode == 'train':
+        print(">>> Starting Training...")
+        best_acc = 0.0
+        for epoch in range(config.EPOCHS):
+            # 训练一个 epoch
+            metrics = trainer.train_epoch(train_loader)
+
+            # 验证泛化能力 (在未见过的 0kg/400kg 上测试)
+            if (epoch + 1) % 5 == 0:
+                val_acc = trainer.evaluate(test_loader)
+                weights = trainer.criterion.get_weights()
+
+                print(f"Epoch {epoch + 1}/{config.EPOCHS} | "
+                      f"Loss: {metrics['loss']:.4f} | "
+                      f"Source Acc: {metrics['acc']:.2f}% | "
+                      f"Target Domain Acc: {val_acc:.2f}%")
+
+                if val_acc > best_acc:
+                    best_acc = val_acc
+                    trainer.save("best_model.pth")
+
+    elif args.mode == 'eval':
+
+        print(">>> Starting Evaluation & Visualization...")
+
+        path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
+
+        if os.path.exists(path):
+
+            # 加载模型
+
+            model.load_state_dict(torch.load(path, map_location=device))
+
+            # 计算目标域精度
+
+            acc = trainer.evaluate(test_loader)
+
+            print(f"Final Target Domain Accuracy: {acc:.2f}%")
+
+            # ================= [新逻辑] =================
+
+            # 为了画出“红色点”，我们需要源域数据
+
+            # 这里的 train_loader 就是源域 (200kg)
+
+            # 为了避免点太多图太乱，我们可以只取一部分源域数据，或者全部取
+
+            vis_dir = os.path.join(config.CHECKPOINT_DIR, "visualizations")
+
+            # 调用可视化流水线，传入 train_loader 作为 source
+
+            run_visualization_pipeline(
+
+                model,
+
+                target_loader=test_loader,
+
+                source_loader=train_loader,  # <--- 关键：注入源域数据
+
+                device=device,
+
+                output_dir=vis_dir,
+
+                acc=acc
+
+            )
+
+            # ============================================
 
 
-def evaluate_unseen_domain(model, loader, device):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for micro_x, speed, y_cls, _ in loader:
-            micro_x, speed, y_cls = micro_x.to(device), speed.to(device), y_cls.to(device)
-            logits, _ = model(micro_x, speed)
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == y_cls).sum().item()
-            total += y_cls.size(0)
-    return 100 * correct / total
+        else:
 
+            print(f"[Error] No checkpoint found at {path}")
 
 if __name__ == "__main__":
     run_ch4_experiment()
