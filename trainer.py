@@ -21,44 +21,44 @@ class Trainer:
             {'params': self.criterion.parameters(), 'lr': 1e-3}
         ], lr=config.LEARNING_RATE)
 
-    def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
+    # trainer.py 部分代码片段
+    def train_epoch(self, dataloader):
         self.model.train()
-        total_loss, correct, total = 0, 0, 0
+        total_loss = 0
 
-        for micro_x, macro_x, speed, y_cls, y_load in dataloader:
-            # 移动数据到设备
-            micro_x, macro_x = micro_x.to(self.device), macro_x.to(self.device)
-            speed, y_cls, y_load = speed.to(self.device), y_cls.to(self.device), y_load.to(self.device)
+        for batch_idx, (micro, macro, ac, spd, y_cls, y_load) in enumerate(dataloader):
+            micro, macro = micro.to(self.device), macro.to(self.device)
+            ac, spd = ac.to(self.device), spd.to(self.device)
+            y_cls, y_load = y_cls.to(self.device), y_load.to(self.device)
 
             self.optimizer.zero_grad()
 
-            if self.config.MODEL_NAME.startswith('Phys-RDLinear') or self.config.MODEL_NAME.startswith('Ablation'):
-                # 我们的模型家族
-                logits, pred_load = self.model(micro_x, macro_x, speed)
+            if "RDLinear" in self.config.MODEL_NAME:
+                logits, pred_load = self.model(micro, macro, ac, spd)
 
+                # MTL Loss
                 if pred_load is not None:
-                    # 开启了 MTL：计算总损失
-                    loss, _, _ = self.criterion(logits, y_cls, pred_load, y_load)
+                    loss, l_cls, l_reg = self.criterion(logits, y_cls, pred_load, y_load)
+
+                    # [Debug] 第一次迭代打印 Loss 比例，防止跑偏
+                    if batch_idx == 0:
+                        print(
+                            f"\r[Debug] Cls_Loss: {l_cls:.4f} | Reg_Loss: {l_reg:.4f} | Weights: {self.criterion.get_weights()}",
+                            end="")
                 else:
-                    # 关闭了 MTL：只算分类损失 (CrossEntropy)
-                    # 注意：criterion 是 UncertaintyLoss，它期望有 pred_load
-                    # 为了简单，直接用 PyTorch 的 CE Loss
                     loss = torch.nn.functional.cross_entropy(logits, y_cls)
             else:
-                # 基线模型
-                full_x = torch.cat([micro_x, macro_x], dim=1)
-                logits, _ = self.model(full_x, speed)
+                # Baseline
+                # cat micro/macro -> [B, 1024]
+                full = torch.cat([micro.squeeze(), macro.squeeze()], dim=1)
+                logits, _ = self.model(full, spd)
                 loss = torch.nn.functional.cross_entropy(logits, y_cls)
 
             loss.backward()
             self.optimizer.step()
-
             total_loss += loss.item()
-            preds = torch.argmax(logits, dim=1)
-            correct += (preds == y_cls).sum().item()
-            total += y_cls.size(0)
 
-        return {"loss": total_loss / len(dataloader), "acc": 100 * correct / total}
+        return {"loss": total_loss / len(dataloader)}
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader, save_path: str = None) -> float:

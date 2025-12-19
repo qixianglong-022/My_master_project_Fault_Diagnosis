@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import pickle
 from torch.utils.data import Dataset
 from config import Ch4Config
 
@@ -8,98 +9,102 @@ from config import Ch4Config
 class Ch4DualStreamDataset(Dataset):
     def __init__(self, config: Ch4Config, mode: str = 'train'):
         self.config = config
-        self.data_dir = config.DATA_DIR
         self.mode = mode
+        self.cls_map = {'HH': 0, 'RU': 1, 'RM': 2, 'SW': 3, 'VU': 4, 'BR': 5, 'KA': 6, 'FB': 7}
 
-        self.cls_map = {
-            'HH': 0, 'RU': 1, 'RM': 2, 'SW': 3,
-            'VU': 4, 'BR': 5, 'KA': 6, 'FB': 7
-        }
+        self.micro, self.macro, self.acoustic, self.speed, self.labels, self.loads = [], [], [], [], [], []
 
-        # 内存缓存，避免反复 IO
-        self.micro_data = []
-        self.macro_data = []
-        self.acoustic_data = []
-        self.speed_data = []
-        self.labels = []
-        self.loads = []
+        # 1. 加载数据到内存
+        self._load_data()
 
-        self._load_all_data()
+        # 2. 归一化逻辑 (防泄露核心)
+        self.scaler_path = os.path.join(config.CHECKPOINT_DIR, "scaler_ch4.pkl")
+        self._apply_normalization()
 
-    def _load_all_data(self):
-        if not os.path.exists(self.data_dir): return
-
+    def _load_data(self):
         target_loads = self.config.TRAIN_LOADS if self.mode == 'train' else self.config.TEST_LOADS
         target_speeds = self.config.TRAIN_SPEEDS if self.mode == 'train' else self.config.TEST_SPEEDS
 
-        files = [f for f in os.listdir(self.data_dir) if f.endswith('_dual.npy')]
-
-        print(f"[{self.mode.upper()}] Loading dataset from {len(files)} source files...")
+        files = [f for f in os.listdir(self.config.DATA_DIR) if f.endswith('_dual.npy')]
 
         for f in files:
-            # Parse filename: HH_2_1_dual.npy
-            try:
-                parts = f.replace('_dual.npy', '').split('_')
-                domain = parts[0]
-                load_id = int(parts[1])
-                speed_id = parts[2]
+            parts = f.replace('_dual.npy', '').split('_')
+            domain, lid, sid = parts[0], int(parts[1]), parts[2]
 
-                # 筛选逻辑
-                phys_load = 0 if load_id == 0 else (200 if load_id == 2 else 400)
-                speed_code = self.config.SPEED_ID_MAP.get(speed_id)
+            phys_load = {0: 0, 2: 200, 4: 400}.get(lid, 0)
+            spd_code = self.config.SPEED_ID_MAP.get(sid)
 
-                if (phys_load in target_loads) and (speed_code in target_speeds):
-                    # 加载大文件
-                    data = np.load(os.path.join(self.data_dir, f), allow_pickle=True).item()
+            if (phys_load in target_loads) and (spd_code in target_speeds):
+                d = np.load(os.path.join(self.config.DATA_DIR, f), allow_pickle=True).item()
+                if len(d['micro']) == 0: continue
 
-                    # 获取样本数 N
-                    N = data['micro'].shape[0]
-                    if N == 0: continue
+                self.micro.append(d['micro'])  # [N, 512]
+                self.macro.append(d['panorama'])  # [N, 512]
+                self.acoustic.append(d['acoustic'])  # [N, 26]
+                self.speed.append(d['speed'])  # [N]
 
-                    # 放入列表
-                    self.micro_data.append(data['micro'])
-                    self.macro_data.append(data['panorama'])
-                    self.acoustic_data.append(data['acoustic'])
-                    self.speed_data.append(data['speed'])
+                N = len(d['micro'])
+                self.labels.append(np.full(N, self.cls_map.get(domain, 0)))
+                self.loads.append(np.full(N, d['load']))
 
-                    # 生成标签 (Scalar -> Vector)
-                    label_vec = np.full(N, self.cls_map.get(domain, 0), dtype=np.int64)
-                    self.labels.append(label_vec)
+        # Concat
+        if self.micro:
+            self.micro = np.concatenate(self.micro)
+            self.macro = np.concatenate(self.macro)
+            self.acoustic = np.concatenate(self.acoustic)
+            self.speed = np.concatenate(self.speed)
+            self.labels = np.concatenate(self.labels)
+            self.loads = np.concatenate(self.loads)
 
-                    # 生成负载标签
-                    load_vec = np.full(N, data['load'], dtype=np.float32)
-                    self.loads.append(load_vec)
-
-            except Exception as e:
-                print(f"Error loading {f}: {e}")
-                continue
-
-        # 拼接所有数据到 Tensor (内存级加速)
-        if len(self.micro_data) > 0:
-            self.micro_data = torch.FloatTensor(np.concatenate(self.micro_data))
-            self.macro_data = torch.FloatTensor(np.concatenate(self.macro_data))
-            self.acoustic_data = torch.FloatTensor(np.concatenate(self.acoustic_data))
-            self.speed_data = torch.FloatTensor(np.concatenate(self.speed_data))
-            self.labels = torch.LongTensor(np.concatenate(self.labels))
-            self.loads = torch.FloatTensor(np.concatenate(self.loads))
-
-            # 预处理：Log 变换 (增强小幅值特征)
-            self.micro_data = torch.log1p(self.micro_data).unsqueeze(-1)  # [Total, 512, 1]
-            self.macro_data = torch.log1p(self.macro_data).unsqueeze(-1)
+            # Log Transform first (for spectra)
+            self.micro = np.log1p(self.micro)
+            self.macro = np.log1p(self.macro)
         else:
-            print(f"[Warn] No data loaded for mode {self.mode}")
+            print(f"[Warn] No data for {self.mode}")
+
+    def _apply_normalization(self):
+        if len(self.micro) == 0: return
+
+        if self.mode == 'train':
+            # 计算统计量
+            scaler = {
+                'micro_mean': np.mean(self.micro, axis=0),
+                'micro_std': np.std(self.micro, axis=0) + 1e-6,
+                'macro_mean': np.mean(self.macro, axis=0),
+                'macro_std': np.std(self.macro, axis=0) + 1e-6,
+                'ac_mean': np.mean(self.acoustic, axis=0),
+                'ac_std': np.std(self.acoustic, axis=0) + 1e-6
+            }
+            with open(self.scaler_path, 'wb') as f:
+                pickle.dump(scaler, f)
+            print(f"[Scaler] Fitting done. Saved to {self.scaler_path}")
+        else:
+            # 加载统计量
+            if os.path.exists(self.scaler_path):
+                with open(self.scaler_path, 'rb') as f:
+                    scaler = pickle.load(f)
+            else:
+                print("[Warn] Scaler not found! Using raw data (Leads to poor performance).")
+                scaler = None
+
+        # 应用变换 (Z-Score)
+        if scaler:
+            self.micro = (self.micro - scaler['micro_mean']) / scaler['micro_std']
+            self.macro = (self.macro - scaler['macro_mean']) / scaler['macro_std']
+            self.acoustic = (self.acoustic - scaler['ac_mean']) / scaler['ac_std']
 
     def __getitem__(self, idx):
-        # 直接从内存取，速度飞快
-        return (
-            self.micro_data[idx],
-            self.macro_data[idx],
-            self.acoustic_data[idx],
-            self.speed_data[idx].unsqueeze(0),  # Scalar -> [1]
-            self.labels[idx],
-            self.loads[idx].unsqueeze(0) / 400.0  # Normalize Load
-        )
+        # 转换为 Tensor
+        mic = torch.FloatTensor(self.micro[idx]).unsqueeze(-1)  # [512, 1]
+        mac = torch.FloatTensor(self.macro[idx]).unsqueeze(-1)
+        ac = torch.FloatTensor(self.acoustic[idx])
+        spd = torch.FloatTensor([self.speed[idx]])  # Scalar [1]
+        lb = torch.LongTensor([self.labels[idx]]).squeeze()
+
+        # Load 归一化: 0~400 -> 0~1
+        ld = torch.FloatTensor([self.loads[idx] / 400.0])
+
+        return mic, mac, ac, spd, lb, ld
 
     def __len__(self):
-        if isinstance(self.micro_data, list): return 0
-        return len(self.micro_data)
+        return len(self.labels)
