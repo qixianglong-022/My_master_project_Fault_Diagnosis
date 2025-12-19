@@ -1,139 +1,129 @@
+# run_rq3_advanced.py
 import os
 import torch
-import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
+
 from config import Ch4Config
 from data_loader_ch4 import Ch4DualStreamDataset
-from models.factory import get_model
+# 直接引用模型定义类，以便灵活实例化
+from models.phys_rdlinear import PhysRDLinearCls
 from trainer import Trainer
 from utils.tools import set_seed
-from utils.visualization import extract_features, set_style  # 复用
+from utils.rq1_kit import evaluate_rq1_comprehensive
+from utils.rq3_kit import compute_mmd, plot_ablation_chart
+
+# === 实验配置 ===
+ABLATION_CONFIGS = {
+    'Ablation_Base': {
+        'pgfa': False, 'mtl': False, 'desc': '无物理引导 (Baseline)'
+    },
+    'Ablation_PGFA': {
+        'pgfa': True, 'mtl': False, 'desc': '仅 PGFA'
+    },
+    'Ablation_MTL': {
+        'pgfa': False, 'mtl': True, 'desc': '仅 MTL'
+    },
+    'Phys_RDLinear': {
+        'pgfa': True, 'mtl': True, 'desc': '完整模型 (Ours)'
+    }
+}
+GPU_ID = 0
 
 
-# === 新增：PGFA 物理对齐可视化工具 ===
-def visualize_pgfa_alignment(model, dataloader, device, save_dir):
-    """
-    画出 Mask 和 Spectrum 的叠加图，证明位置对齐。
-    """
-    model.eval()
-    font_prop = set_style()  # 设置中文字体
-    os.makedirs(save_dir, exist_ok=True)
+def main():
+    print("=========================================================")
+    print("   RQ3 Automation: Physics Module Ablation Study")
+    print("=========================================================")
 
-    # 抽取一个 Batch
-    micro, macro, acoustic, speed, y_cls, load = next(iter(dataloader))
-    micro = micro.to(device)
-    speed = speed.to(device)
+    rq3_root = os.path.join("checkpoints_ch4", "rq3")
+    os.makedirs(rq3_root, exist_ok=True)
 
-    # 找一个转速比较典型的样本 (例如最接近 45Hz 的)
-    target_speed = 45.0
-    diff = torch.abs(speed - target_speed)
-    idx = torch.argmin(diff)
-
-    # 获取该样本数据
-    sample_micro = micro[idx]  # [512, 1] (Log Spectrum)
-    sample_speed = speed[idx]  # Scalar (Hz)
-
-    # 1. 计算 PGFA Mask
-    # 我们需要手动调用 model.pgfa 来生成 mask
-    if not hasattr(model, 'pgfa'):
-        print("[Vis] Model has no PGFA module, skipping alignment plot.")
-        return
-
-    with torch.no_grad():
-        # 模拟 forward 过程中的输入
-        # 注意：Mask 是根据 speed 生成的，与输入内容无关，只与频率轴有关
-        # model.pgfa.forward(seasonal, speed) -> return seasonal * (1 + alpha * mask)
-        # 我们想单独把 mask 拿出来。
-
-        # 重新生成 Mask (复制 PGFA 内部逻辑)
-        f_axis = model.pgfa.freq_axis.to(device).view(1, -1, 1)  # [1, 512, 1]
-        s = sample_speed.view(1, 1, 1)
-        sigma = model.pgfa.sigma
-
-        # Gaussian Mask 公式
-        mask = torch.exp(- (f_axis - s) ** 2 / (2 * sigma ** 2)) + \
-               torch.exp(- (f_axis - 2 * s) ** 2 / (2 * sigma ** 2)) + \
-               torch.exp(- (f_axis - 3 * s) ** 2 / (2 * sigma ** 2))
-
-        mask_np = mask.cpu().numpy().flatten()
-
-    # 2. 获取频谱 (Micro Stream)
-    # 输入已经是 Log 谱了，直接画
-    spec_np = sample_micro.cpu().numpy().flatten()
-
-    # 3. 绘图
-    plt.figure(figsize=(10, 4))
-
-    # 双坐标轴：左边频谱，右边 Mask 权重
-    ax1 = plt.gca()
-    ax2 = ax1.twinx()
-
-    # 画频谱
-    freqs = np.linspace(0, 512, len(spec_np))  # 假设 0-512Hz
-    ax1.plot(freqs, spec_np, color='#1f77b4', alpha=0.6, label='Micro-Stream Spectrum (Log)')
-    ax1.set_xlabel('Frequency (Hz)', fontproperties=font_prop, fontsize=12)
-    ax1.set_ylabel('Amplitude (Log)', fontproperties=font_prop, fontsize=12, color='#1f77b4')
-
-    # 画 Mask
-    ax2.plot(freqs, mask_np, color='#d62728', linewidth=2, linestyle='--', label='PGFA Attention Mask')
-    ax2.set_ylabel('Attention Weight', fontproperties=font_prop, fontsize=12, color='#d62728')
-
-    # 标注转速
-    real_speed = sample_speed.item()
-    plt.title(f"PGFA 物理对齐验证 (转速: {real_speed:.1f} Hz)", fontproperties=font_prop, fontsize=14)
-
-    # 图例
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', prop=font_prop)
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "Vis_PGFA_Alignment.pdf"))
-    plt.close()
-    print(f">>> [Vis] PGFA Alignment plot saved to {save_dir}/Vis_PGFA_Alignment.pdf")
-
-
-# === 主消融实验逻辑 ===
-def run_ablation(model_alias, gpu_id=0):
     config = Ch4Config()
-    config.MODEL_NAME = model_alias
-    config.CHECKPOINT_DIR = os.path.join("checkpoints_rq3", model_alias)
-    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
     set_seed(config.SEED)
-    device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{GPU_ID}' if torch.cuda.is_available() else 'cpu')
 
-    print(f"\n>>> [RQ3] Running: {model_alias}")
+    # 1. 准备数据
+    train_ds = Ch4DualStreamDataset(config, mode='train')
+    test_ds = Ch4DualStreamDataset(config, mode='test')
 
-    # 数据 (Shuffle=True for training)
-    train_dl = DataLoader(Ch4DualStreamDataset(config, 'train'), batch_size=config.BATCH_SIZE, shuffle=True)
-    test_dl = DataLoader(Ch4DualStreamDataset(config, 'test'), batch_size=config.BATCH_SIZE, shuffle=False)
+    train_dl = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True)
 
-    # 模型
-    model = get_model(model_alias, config).to(device)
-    trainer = Trainer(config, model, device)
+    # MMD 计算用的 Loader (Source 无 Shuffle, Target Shuffle 均可)
+    mmd_src_dl = DataLoader(train_ds, batch_size=64, shuffle=False)
+    mmd_tgt_dl = DataLoader(test_ds, batch_size=64, shuffle=True)
+    test_dl = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
 
-    # 训练
-    for epoch in range(20):
-        trainer.train_epoch(train_dl)
+    results = []
 
-    # 评估
-    eval_csv = os.path.join(config.CHECKPOINT_DIR, "eval_all.csv")
-    trainer.evaluate(test_dl, save_path=eval_csv)
+    for cfg_name, settings in ABLATION_CONFIGS.items():
+        print(f"\n>>> [Task] Running: {cfg_name} ({settings['desc']})")
 
-    # === [Key] 如果是 Phys-RDLinear，画物理对齐图 ===
-    if model_alias == 'Phys-RDLinear':
-        # 用测试集数据画，看看泛化时的 Mask 对不对
-        visualize_pgfa_alignment(model, test_dl, device, config.CHECKPOINT_DIR)
+        # === [关键修复] 设置 config.MODEL_NAME ===
+        config.MODEL_NAME = cfg_name
+        # Trainer 需要依靠这个名字来决定 Forward 传参方式
+        # ========================================
 
-    return eval_csv
+        save_dir = os.path.join(rq3_root, cfg_name)
+        os.makedirs(save_dir, exist_ok=True)
+        config.CHECKPOINT_DIR = save_dir  # 同时更新 Checkpoint 路径
+
+        # 1. 初始化模型 (手动传入 flags)
+        model = PhysRDLinearCls(
+            config,
+            enable_pgfa=settings['pgfa'],
+            enable_mtl=settings['mtl'],
+            enable_acoustic=True
+        ).to(device)
+
+        # 2. 训练
+        trainer = Trainer(config, model, device)
+        ckpt_path = os.path.join(save_dir, "model.pth")
+
+        if os.path.exists(ckpt_path):
+            print("    [Info] Loading checkpoint...")
+            model.load_state_dict(torch.load(ckpt_path))
+        else:
+            print("    [Info] Training...")
+            epochs = 25
+            for epoch in range(epochs):
+                trainer.train_epoch(train_dl)
+            torch.save(model.state_dict(), ckpt_path)
+
+        # 3. 评估准确率
+        print("    [Eval] Evaluating Accuracy...")
+        # 此时传入正确的 config.MODEL_NAME 给评估函数
+        metrics = evaluate_rq1_comprehensive(model, test_dl, device, save_dir, cfg_name)
+
+        # 4. 计算 MMD
+        print("    [Eval] Calculating MMD Distance (Source <-> Target)...")
+        mmd_val = compute_mmd(model, mmd_src_dl, mmd_tgt_dl, device)
+        print(f"    -> MMD: {mmd_val:.4f}")
+
+        row = {
+            'Config': cfg_name,
+            'Description': settings['desc'],
+            'Avg_Acc': metrics.get('Avg_Acc', 0),
+            'Acc_0kg': metrics.get('Acc_0kg', 0),
+            'Acc_400kg': metrics.get('Acc_400kg', 0),
+            'MMD_Distance': mmd_val
+        }
+        results.append(row)
+
+    # 5. 汇总与绘图
+    if results:
+        df = pd.DataFrame(results)
+        csv_path = os.path.join(rq3_root, "RQ3_Ablation_Results.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"\n>>> 汇总表已保存: {csv_path}")
+
+        # 生成论文图表
+        plot_ablation_chart(csv_path, rq3_root)
+
+    print("\n=========================================================")
+    print("   RQ3 Completed! See checkpoints/rq3/")
+    print("=========================================================")
 
 
 if __name__ == "__main__":
-    configs = ['Ablation-Base', 'Ablation-PGFA', 'Ablation-MTL', 'Phys-RDLinear']
-
-    for c in configs:
-        run_ablation(c)
-
-    print("\n>>> RQ3 All Done.")
+    main()

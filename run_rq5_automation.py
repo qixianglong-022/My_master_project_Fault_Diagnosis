@@ -1,117 +1,165 @@
+# run_rq5_advanced.py
 import os
 import torch
 import pandas as pd
+import numpy as np
 from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score
+
 from config import Ch4Config
 from data_loader_ch4 import Ch4DualStreamDataset
 from models.factory import get_model
+from trainer import Trainer
 from utils.tools import set_seed
+from utils.rq5_kit import add_gaussian_noise, plot_noise_robustness_chart
+
+# === 实验配置 ===
+# 加入全部模型进行全方位对比
+MODELS_TO_COMPARE = [
+    'Phys-RDLinear',
+    'Vanilla RDLinear',  # 增加: 验证物理模块的抗噪贡献
+    'TiDE',
+    'FD-CNN',
+    'ResNet-18'  # 增加: 验证深度模型的脆弱性
+]
+
+# 测试信噪比列表 (注意：None 代表 Clean)
+# 这里的顺序只影响计算顺序，绘图顺序由 rq5_kit 控制
+SNR_LEVELS = [-5, 0, 5, 10, None]
+
+GPU_ID = 0
 
 
-class NoiseInjector:
-    @staticmethod
-    def add_noise(tensor_log, snr_db):
-        """
-        [物理修正]
-        输入 tensor_log 是 log1p 后的幅值谱。
-        必须还原到线性域加噪，再变换回来，才是真正的加性高斯白噪 (AWGN)。
-        """
-        if snr_db is None: return tensor_log
+def evaluate_with_noise(model, dataloader, device, snr):
+    """带噪声注入的评估函数"""
+    model.eval()
+    all_preds, all_labels = [], []
 
-        device = tensor_log.device
+    with torch.no_grad():
+        for micro, macro, ac, spd, y_cls, y_load in dataloader:
+            micro, macro, ac, spd = micro.to(device), macro.to(device), ac.to(device), spd.to(device)
 
-        # 1. 反 Log 变换 (还原线性幅值)
-        # y = log1p(x) -> x = exp(y) - 1
-        sig_linear = torch.expm1(tensor_log)
+            # --- 1. 筛选 0kg (轻载) 样本 ---
+            load_real = (y_load * 400).round().int()
+            mask_0kg = (load_real == 0).squeeze()
 
-        # 2. 计算信号功率 (平均能量)
-        sig_power = torch.mean(sig_linear ** 2)
+            if mask_0kg.sum() == 0: continue
 
-        # 3. 计算噪声功率
-        noise_power = sig_power / (10 ** (snr_db / 10))
-        noise_std = torch.sqrt(noise_power)
+            micro = micro[mask_0kg]
+            macro = macro[mask_0kg]
+            ac = ac[mask_0kg]
+            spd = spd[mask_0kg]
+            y_cls = y_cls[mask_0kg]
 
-        # 4. 生成噪声 (保证非负，因为幅值谱非负)
-        noise = torch.randn_like(sig_linear) * noise_std
+            # --- 2. 注入噪声 ---
+            if snr is not None:
+                micro = add_gaussian_noise(micro, snr)
+                macro = add_gaussian_noise(macro, snr)
+                ac = add_gaussian_noise(ac, snr)
 
-        # 5. 加噪 (注意：幅值谱叠加是向量叠加，简单近似为幅值相加可能会有相位误差，
-        # 但在仅有幅值谱的情况下，这是标准做法。取绝对值防止负数)
-        noisy_linear = torch.abs(sig_linear + noise)
+            # --- 3. 推理 ---
+            is_phys = hasattr(model, 'pgfa') or model.__class__.__name__.startswith('Phys')
+            if is_phys:
+                logits, _ = model(micro, macro, ac, spd)
+            else:
+                full_x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
+                logits, _ = model(full_x, spd)
 
-        # 6. 转回 Log 域
-        return torch.log1p(noisy_linear)
+            preds = torch.argmax(logits, dim=1)
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(y_cls.cpu().numpy())
+
+    if not all_preds: return 0.0
+    y_pred = np.concatenate(all_preds)
+    y_true = np.concatenate(all_labels)
+    acc = accuracy_score(y_true, y_pred) * 100
+    return acc
 
 
-def run_rq5_experiments():
+def main():
+    print("=========================================================")
+    print("   RQ5 Automation: Noise Robustness (Full Comparison)")
+    print("=========================================================")
+
+    rq5_root = os.path.join("checkpoints_ch4", "rq5")
+    os.makedirs(rq5_root, exist_ok=True)
+
     config = Ch4Config()
     set_seed(config.SEED)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{GPU_ID}' if torch.cuda.is_available() else 'cpu')
 
-    print("\n>>> [RQ5] Robustness Test")
-
-    # 只需要测试集
-    test_dl = DataLoader(Ch4DualStreamDataset(config, 'test'), batch_size=config.BATCH_SIZE, shuffle=False)
-
-    models = ['FD-CNN', 'TiDE', 'Phys-RDLinear']
-    snrs = [None, 10, 5, 0, -5]
+    # 数据集
+    test_dl = DataLoader(Ch4DualStreamDataset(config, mode='test'),
+                         batch_size=config.BATCH_SIZE, shuffle=False)
+    # 用于补训的 Train set
+    train_ds = Ch4DualStreamDataset(config, mode='train')
+    train_dl = DataLoader(train_ds, batch_size=config.BATCH_SIZE, shuffle=True)
 
     results = []
 
-    for model_name in models:
-        print(f"\nTesting {model_name}...")
+    for model_name in MODELS_TO_COMPARE:
+        print(f"\n>>> [Task] Evaluating Model: {model_name}")
+
+        # 权重路径
+        ckpt_dir = os.path.join("checkpoints_ch4", "rq1", model_name)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_path = os.path.join(ckpt_dir, "model.pth")
+
+        # 初始化
+        config.MODEL_NAME = model_name
         try:
-            # 尝试加载权重 (优先找 RQ3 训练好的最佳模型)
             model = get_model(model_name, config).to(device)
-            # 路径逻辑需要根据你实际训练保存的位置调整
-            # 这里假设之前跑过 RQ1/RQ3，权重在 checkpoints_ch4 或 checkpoints_rq3 下
-            # 为了自动化演示，这里略过加载权重的详细 check，假设文件存在
-            # model.load_state_dict(...)
-        except:
-            print("Skipping (No weights)")
+        except Exception as e:
+            print(f"    [Error] Init failed: {e}")
             continue
 
-        model.eval()
+        # 智能加载或训练
+        if os.path.exists(ckpt_path):
+            print(f"    [Info] Loading existing checkpoint...")
+            try:
+                model.load_state_dict(torch.load(ckpt_path, weights_only=False))
+            except:
+                model.load_state_dict(torch.load(ckpt_path))
+        else:
+            print(f"    [Warn] Checkpoint missing. Training {model_name} now...")
+            trainer = Trainer(config, model, device)
+            epochs = 25
+            for epoch in range(epochs):
+                trainer.train_epoch(train_dl)
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"    [Info] Training done.")
+
         row = {'Model': model_name}
 
-        for snr in snrs:
-            correct, total = 0, 0
-            with torch.no_grad():
-                # [Fix] 解包 6 个
-                for micro, macro, acoustic, speed, y_cls, y_load in test_dl:
-                    micro = micro.to(device)
-                    macro = macro.to(device)
-                    acoustic = acoustic.to(device)
-                    speed = speed.to(device)
-                    y_cls = y_cls.to(device)
-
-                    # 注入噪声
-                    micro = NoiseInjector.add_noise(micro, snr)
-                    macro = NoiseInjector.add_noise(macro, snr)
-                    acoustic = NoiseInjector.add_noise(acoustic, snr)
-
-                    if model_name == 'Phys-RDLinear':
-                        logits, _ = model(micro, macro, acoustic, speed)
-                    else:
-                        # 基线模型通常只用了 micro+macro，或者需要自己拼接
-                        # factory.py 里的基线模型 forward 签名可能不同，需注意
-                        # 这里假设基线模型 forward(cat_x, speed)
-                        full_x = torch.cat([micro, macro], dim=1)
-                        logits, _ = model(full_x, speed)
-
-                    preds = torch.argmax(logits, dim=1)
-                    correct += (preds == y_cls).sum().item()
-                    total += y_cls.size(0)
-
-            acc = 100 * correct / total
-            col = f"{snr}dB" if snr is not None else "Clean"
-            row[col] = acc
-            print(f"  SNR {col}: {acc:.2f}%")
+        # 遍历 SNR
+        for snr in SNR_LEVELS:
+            snr_name = f"{snr}dB" if snr is not None else "Clean"
+            acc = evaluate_with_noise(model, test_dl, device, snr)
+            row[f"Acc_{snr_name}"] = acc
+            print(f"    -> SNR {snr_name}: {acc:.2f}%")
 
         results.append(row)
 
+    # 汇总与绘图
     if results:
-        pd.DataFrame(results).to_csv("Table_RQ5_Robustness.csv", index=False)
+        df = pd.DataFrame(results)
+        # 按照用户期望的 X 轴顺序排列 CSV 列 (方便人工看)
+        cols = ['Model', 'Acc_-5dB', 'Acc_0dB', 'Acc_5dB', 'Acc_10dB', 'Acc_Clean']
+        # 填充缺失列防报错
+        for c in cols:
+            if c not in df.columns: df[c] = 0.0
+        df = df[cols]
+
+        csv_path = os.path.join(rq5_root, "RQ5_Noise_Results.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"\n>>> 汇总表已保存: {csv_path}")
+
+        plot_noise_robustness_chart(csv_path, rq5_root)
+
+    print("\n=========================================================")
+    print("   RQ5 Completed! See checkpoints/rq5/")
+    print("=========================================================")
 
 
 if __name__ == "__main__":
-    run_rq5_experiments()
+    main()

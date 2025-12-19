@@ -58,7 +58,7 @@ def run_ch4_experiment():
 
     # [修改策略] 针对 ResNet 减少轮数，其他模型保持 55
     if args.model_name == 'ResNet-18':
-        TRAIN_EPOCHS = 25  # ResNet 收敛很快，10-15轮通常足够看个大概
+        TRAIN_EPOCHS = 15  # ResNet 收敛很快，10-15轮通常足够看个大概
     else:
         TRAIN_EPOCHS = 55
 

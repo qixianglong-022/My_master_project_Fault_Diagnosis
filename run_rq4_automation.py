@@ -1,112 +1,209 @@
+# run_rq4_advanced.py
 import os
 import torch
+import torch.nn.functional as F
 import pandas as pd
+import numpy as np
 from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score, f1_score
+
 from config import Ch4Config
 from data_loader_ch4 import Ch4DualStreamDataset
-from models.phys_rdlinear import PhysRDLinearCls  # 直接调用类
+from models.factory import get_model
 from trainer import Trainer
 from utils.tools import set_seed
+from utils.rq4_kit import plot_rq4_modal_comparison
+
+# === 实验配置 ===
+EXPERIMENTS = {
+    'Vib_Only': {
+        'desc': '仅振动 (Mask Audio)',
+        'mask_vib': False, 'mask_audio': True
+    },
+    'Audio_Only': {
+        'desc': '仅声纹 (Mask Vibration)',
+        'mask_vib': True, 'mask_audio': False
+    },
+    'Fusion': {
+        'desc': '多模态融合 (Full)',
+        'mask_vib': False, 'mask_audio': False
+    }
+}
+GPU_ID = 0
 
 
-class MultimodalTrainer(Trainer):
-    def __init__(self, config, model, device, mode='fusion'):
+class MaskedTrainer(Trainer):
+    """RQ4 专用掩码训练器"""
+
+    def __init__(self, config, model, device, mask_cfg):
         super().__init__(config, model, device)
-        self.mode = mode  # 'vib_only', 'acoustic_only', 'fusion'
+        self.mask_cfg = mask_cfg
 
-    def _mask_modalities(self, micro, macro, acoustic):
-        if self.mode == 'vib_only':
-            # 屏蔽声纹
-            acoustic = torch.zeros_like(acoustic)
-        elif self.mode == 'acoustic_only':
-            # 屏蔽振动
+    def _apply_mask(self, micro, macro, ac):
+        if self.mask_cfg['mask_vib']:
             micro = torch.zeros_like(micro)
             macro = torch.zeros_like(macro)
-        return micro, macro, acoustic
+        if self.mask_cfg['mask_audio']:
+            ac = torch.zeros_like(ac)
+        return micro, macro, ac
 
     def train_epoch(self, dataloader):
         self.model.train()
-        total_loss, correct, total = 0, 0, 0
+        total_loss = 0
+        for micro, macro, ac, spd, y_cls, y_load in dataloader:
+            micro, macro, ac, spd = micro.to(self.device), macro.to(self.device), ac.to(self.device), spd.to(
+                self.device)
+            y_cls, y_load = y_cls.to(self.device), y_load.to(self.device).float().unsqueeze(1)
 
-        # [Fix] 解包 6 个
-        for micro, macro, acoustic, speed, y_cls, y_load in dataloader:
-            micro, macro = micro.to(self.device), macro.to(self.device)
-            acoustic, speed = acoustic.to(self.device), speed.to(self.device)
-            y_cls, y_load = y_cls.to(self.device), y_load.to(self.device)
-
-            micro, macro, acoustic = self._mask_modalities(micro, macro, acoustic)
+            # Mask
+            micro, macro, ac = self._apply_mask(micro, macro, ac)
 
             self.optimizer.zero_grad()
-            logits, pred_load = self.model(micro, macro, acoustic, speed)
+            logits, pred_load = self.model(micro, macro, ac, spd)
 
-            # RQ4 默认开启 MTL
-            loss, _, _ = self.criterion(logits, y_cls, pred_load, y_load)
+            # Loss (使用 F 接口避免 AttributeError)
+            loss_cls = F.cross_entropy(logits, y_cls)
+            loss = loss_cls
+            if pred_load is not None:
+                loss += 0.5 * F.mse_loss(pred_load, y_load)
 
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
-            correct += (torch.argmax(logits, dim=1) == y_cls).sum().item()
-            total += y_cls.size(0)
+        return {'loss': total_loss / len(dataloader)}
 
-        return {"loss": total_loss / len(dataloader), "acc": 100 * correct / total}
 
-    @torch.no_grad()
-    def evaluate(self, dataloader, save_path=None):
-        self.model.eval()
-        correct, total = 0, 0
-        results = []
+def evaluate_rq4_local(model, dataloader, device, mask_cfg):
+    """
+    RQ4 专用评估逻辑
+    关键：如果是 Audio_Only，必须禁用 PEG (物理能量门控)，否则所有样本会被判为健康
+    """
+    model.eval()
+    all_preds, all_labels, all_loads = [], [], []
 
-        for micro, macro, acoustic, speed, y_cls, y_load in dataloader:
-            micro, macro = micro.to(self.device), macro.to(self.device)
-            acoustic, speed = acoustic.to(self.device), speed.to(self.device)
+    # 智能 PEG 开关
+    # 只有当振动信号存在 (mask_vib=False) 时，PEG 才有意义
+    ENABLE_PEG = not mask_cfg['mask_vib']
+    PEG_THRESHOLD = 0.05
 
-            micro, macro, acoustic = self._mask_modalities(micro, macro, acoustic)
+    with torch.no_grad():
+        for micro, macro, ac, spd, y_cls, y_load in dataloader:
+            micro, macro, ac, spd = micro.to(device), macro.to(device), ac.to(device), spd.to(device)
 
-            logits, _ = self.model(micro, macro, acoustic, speed)
+            # Mask
+            if mask_cfg['mask_vib']:
+                micro = torch.zeros_like(micro)
+                macro = torch.zeros_like(macro)
+            if mask_cfg['mask_audio']:
+                ac = torch.zeros_like(ac)
+
+            # Inference
+            # 强制 4 参数调用
+            logits, _ = model(micro, macro, ac, spd)
             preds = torch.argmax(logits, dim=1)
-            correct += (preds == y_cls).sum().item()
-            total += y_cls.size(0)
 
-            # 保存用于F1计算
-            b_true = y_cls.cpu().numpy()
-            b_pred = preds.cpu().numpy()
-            for i in range(len(b_true)):
-                results.append({'True': b_true[i], 'Pred': b_pred[i]})
+            # PEG (仅在振动模式下启用)
+            if ENABLE_PEG:
+                input_rms = torch.sqrt(torch.mean(micro.squeeze(-1) ** 2, dim=1))
+                is_noise = input_rms < PEG_THRESHOLD
+                preds[is_noise] = 0
 
-        if save_path:
-            pd.DataFrame(results).to_csv(save_path, index=False)
-        return 100 * correct / total
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(y_cls.cpu().numpy())
+            all_loads.append(y_load.cpu().numpy())
+
+    # 汇总指标
+    y_pred = np.concatenate(all_preds)
+    y_true = np.concatenate(all_labels)
+    loads_real = (np.concatenate(all_loads).flatten() * 400).round().astype(int)
+
+    metrics = {}
+    metrics['Avg_Acc'] = accuracy_score(y_true, y_pred) * 100
+    metrics['Avg_F1'] = f1_score(y_true, y_pred, average='macro') * 100
+
+    # 分负载计算
+    for ld in [0, 400]:
+        mask = (loads_real == ld)
+        if np.sum(mask) > 0:
+            acc = accuracy_score(y_true[mask], y_pred[mask]) * 100
+            metrics[f'Acc_{ld}kg'] = acc
+        else:
+            metrics[f'Acc_{ld}kg'] = 0.0
+
+    return metrics
 
 
-def run_rq4_task(config_mode, gpu_id=0):
+def main():
+    print("=========================================================")
+    print("   RQ4 Automation: Multi-Modal Ablation Study")
+    print("=========================================================")
+
+    rq4_root = os.path.join("checkpoints_ch4", "rq4")
+    os.makedirs(rq4_root, exist_ok=True)
+
     config = Ch4Config()
-    config.MODEL_NAME = f"Multimodal_{config_mode}"
-    config.CHECKPOINT_DIR = os.path.join("checkpoints_rq4", config.MODEL_NAME)
-    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
+    config.MODEL_NAME = 'Phys-RDLinear'  # RQ4 固定模型
     set_seed(config.SEED)
-    device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{GPU_ID}' if torch.cuda.is_available() else 'cpu')
 
-    print(f"\n>>> [RQ4] Mode: {config_mode}")
+    train_dl = DataLoader(Ch4DualStreamDataset(config, mode='train'),
+                          batch_size=config.BATCH_SIZE, shuffle=True)
+    test_dl = DataLoader(Ch4DualStreamDataset(config, mode='test'),
+                         batch_size=config.BATCH_SIZE, shuffle=False)
 
-    train_dl = DataLoader(Ch4DualStreamDataset(config, 'train'), batch_size=config.BATCH_SIZE, shuffle=True)
-    test_dl = DataLoader(Ch4DualStreamDataset(config, 'test'), batch_size=config.BATCH_SIZE, shuffle=False)
+    results = []
 
-    # 必须开启声纹
-    model = PhysRDLinearCls(config, enable_pgfa=True, enable_mtl=True, enable_acoustic=True).to(device)
+    for cfg_name, mask_settings in EXPERIMENTS.items():
+        print(f"\n>>> [Task] Running: {cfg_name} ({mask_settings['desc']})")
 
-    trainer = MultimodalTrainer(config, model, device, mode=config_mode)
+        save_dir = os.path.join(rq4_root, cfg_name)
+        os.makedirs(save_dir, exist_ok=True)
 
-    for epoch in range(20):
-        trainer.train_epoch(train_dl)
+        # 1. 初始化
+        model = get_model('Phys-RDLinear', config).to(device)
 
-    csv_path = os.path.join(config.CHECKPOINT_DIR, "eval_rq4.csv")
-    acc = trainer.evaluate(test_dl, save_path=csv_path)
-    print(f"    Acc: {acc:.2f}%")
+        # 2. 训练
+        trainer = MaskedTrainer(config, model, device, mask_settings)
+        ckpt_path = os.path.join(save_dir, "model.pth")
 
-    return acc
+        if os.path.exists(ckpt_path):
+            print("    [Info] Loading checkpoint...")
+            # 增加 weights_only=False 避免警告 (或按需处理)
+            model.load_state_dict(torch.load(ckpt_path))
+        else:
+            print("    [Info] Training...")
+            epochs = 30
+            for epoch in range(epochs):
+                trainer.train_epoch(train_dl)
+            torch.save(model.state_dict(), ckpt_path)
+
+        # 3. 评估
+        print("    [Eval] Evaluating...")
+        metrics = evaluate_rq4_local(model, test_dl, device, mask_settings)
+
+        row = {
+            'Config': cfg_name,
+            'Description': mask_settings['desc'],
+            'Avg_Acc': metrics['Avg_Acc'],
+            'Acc_0kg': metrics['Acc_0kg'],
+            'Acc_400kg': metrics['Acc_400kg']
+        }
+        results.append(row)
+        print(f"    -> Avg Acc: {row['Avg_Acc']:.2f}% (0kg: {row['Acc_0kg']:.1f}%)")
+
+    # 4. 汇总与绘图
+    if results:
+        df = pd.DataFrame(results)
+        csv_path = os.path.join(rq4_root, "RQ4_Modal_Analysis.csv")
+        df.to_csv(csv_path, index=False)
+        print(f"\n>>> 汇总表已保存: {csv_path}")
+
+        plot_rq4_modal_comparison(csv_path, rq4_root)
+
+    print("\n=========================================================")
+    print("   RQ4 Completed! See checkpoints/rq4/")
+    print("=========================================================")
 
 
 if __name__ == "__main__":
-    modes = ['vib_only', 'acoustic_only', 'fusion']
-    for m in modes:
-        run_rq4_task(m)
+    main()

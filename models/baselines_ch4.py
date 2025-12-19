@@ -30,16 +30,23 @@ class STFTLayer(nn.Module):
 
         # [修复点] 使用 Freq_Dim 避免覆盖 F (torch.nn.functional)
         B, Freq_Dim, T = x_mag.shape
-        x_mag = x_mag.view(B, -1)
+
+        # === [CRITICAL FIX] ===
+        # 原代码: x_mag = x_mag.view(B, -1) -> 报错 RuntimeError
+        # 修改为: .reshape(B, -1)
+        x_mag = x_mag.reshape(B, -1)
+        # ======================
+
         x_mag -= x_mag.min(dim=1, keepdim=True)[0]
         x_mag /= (x_mag.max(dim=1, keepdim=True)[0] + 1e-6)
-        x_mag = x_mag.view(B, Freq_Dim, T)
+
+        # 还原回 [B, F, T]
+        x_mag = x_mag.reshape(B, Freq_Dim, T)
 
         # 扩展为 3 通道 (RGB)
         x_img = x_mag.unsqueeze(1).repeat(1, 3, 1, 1)  # [B, 3, F, T]
 
         # Resize 到 224x224 (为了适配标准 ResNet 感受野)
-        # 此时 F 指代的是 torch.nn.functional
         x_img = F.interpolate(x_img, size=(224, 224), mode='bilinear', align_corners=False)
 
         return x_img
