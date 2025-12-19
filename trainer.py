@@ -33,25 +33,20 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            if "RDLinear" in self.config.MODEL_NAME:
+            # Forward
+            if self.config.MODEL_NAME.startswith('Phys') or self.config.MODEL_NAME.startswith('Ablation'):
                 logits, pred_load = self.model(micro, macro, ac, spd)
-
-                # MTL Loss
-                if pred_load is not None:
-                    loss, l_cls, l_reg = self.criterion(logits, y_cls, pred_load, y_load)
-
-                    # [Debug] 第一次迭代打印 Loss 比例，防止跑偏
-                    if batch_idx == 0:
-                        print(
-                            f"\r[Debug] Cls_Loss: {l_cls:.4f} | Reg_Loss: {l_reg:.4f} | Weights: {self.criterion.get_weights()}",
-                            end="")
-                else:
-                    loss = torch.nn.functional.cross_entropy(logits, y_cls)
             else:
-                # Baseline
-                # cat micro/macro -> [B, 1024]
-                full = torch.cat([micro.squeeze(), macro.squeeze()], dim=1)
-                logits, _ = self.model(full, spd)
+                # Baselines: Concat inputs
+                full_x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
+                logits, pred_load = self.model(full_x, spd)
+
+            # Loss Calculation
+            if pred_load is not None:
+                # MTL
+                loss, l_cls, l_reg = self.criterion(logits, y_cls, pred_load, y_load)
+            else:
+                # Single Task
                 loss = torch.nn.functional.cross_entropy(logits, y_cls)
 
             loss.backward()

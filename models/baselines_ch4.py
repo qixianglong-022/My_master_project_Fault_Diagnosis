@@ -2,12 +2,51 @@ import torch
 import torch.nn as nn
 from torchvision.models import resnet18, ResNet18_Weights
 
+
+class ResNet18_1D(nn.Module):
+    """
+    [公平基线] 将 ResNet-18 修改为 1D 卷积版本，
+    或者将输入视为 (1, H, W) 的单通道图像 (Spectrogram)。
+    这里为了最简单且公平，我们使用 1D 卷积重写第一层，
+    保留后续 2D 结构（将 Time 视为 Width, Feature=1 视为 Height）。
+    """
+
+    def __init__(self, num_classes=8, input_len=1024):
+        super().__init__()
+        # 加载预训练权重
+        self.backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+
+        # 修改第一层：适应单通道输入
+        # 原始: Conv2d(3, 64, 7x7)
+        # 修改: Conv2d(1, 64, 7x7)
+        old_w = self.backbone.conv1.weight.data
+        new_w = old_w.mean(dim=1, keepdim=True)  # RGB 平均
+        self.backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.backbone.conv1.weight.data = new_w
+
+        # 修改全连接层
+        self.backbone.fc = nn.Linear(512, num_classes)
+
+    def forward(self, x, speed=None):
+        # x: [B, 1024] -> Reshape to [B, 1, 32, 32]
+        # 虽然这破坏了物理邻域，但这是 CV 模型处理 1D 信号最常见的 Baseline 方法
+        B = x.size(0)
+        # 补齐到 1024 (如果不足)
+        if x.size(1) != 1024:
+            x = torch.nn.functional.pad(x, (0, 1024 - x.size(1)))
+
+        x_img = x.view(B, 1, 32, 32)
+        return self.backbone(x_img), None
+
+
 class FD_CNN(nn.Module):
+    """纯频域 1D-CNN"""
+
     def __init__(self, num_classes=8, freq_dim=1024):
         super().__init__()
         self.net = nn.Sequential(
-            # 大卷积核提取宽带特征
-            nn.Conv1d(1, 16, kernel_size=64, stride=4, padding=8),
+            # 大核卷积提取宽带特征
+            nn.Conv1d(1, 16, kernel_size=64, stride=4, padding=30),
             nn.BatchNorm1d(16), nn.ReLU(),
             nn.MaxPool1d(2),
 
@@ -45,34 +84,6 @@ class TiDE_Cls(nn.Module):
         feat = self.encoder(combined)
         return self.fc(feat), None
 
-
-class ResNet18_Thin(nn.Module):
-    def __init__(self, num_classes=8, input_len=1024):
-        super().__init__()
-        # 1. 加载预训练权重 (关键!)
-        self.model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-
-        # 2. 修改第一层 Conv
-        # 假设输入 reshape 成 32x32 的单通道图
-        # 原始: Conv2d(3, 64, k=7, s=2, p=3)
-        # 修改: Conv2d(1, 64, ...)
-        # 为了保留预训练权重，我们取 RGB 通道的平均值作为新权重
-        old_weight = self.model.conv1.weight.data  # [64, 3, 7, 7]
-        new_weight = torch.mean(old_weight, dim=1, keepdim=True)  # [64, 1, 7, 7]
-
-        self.model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.model.conv1.weight.data = new_weight
-
-        # 3. 修改 FC 层
-        self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
-
-    def forward(self, x, speed=None):
-        # x: [B, 1024] (Micro + Macro)
-        # Reshape: [B, 1, 32, 32]
-        B = x.shape[0]
-        # 确保能开方，或者 Padding
-        img = x.view(B, 1, 32, 32)
-        return self.model(img), None
 
 class Vanilla_RDLinear_Cls(nn.Module):
     def __init__(self, num_classes=8, freq_dim=512):
