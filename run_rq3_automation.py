@@ -2,181 +2,138 @@ import os
 import torch
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
-
-# 导入项目模块
 from config import Ch4Config
 from data_loader_ch4 import Ch4DualStreamDataset
 from models.factory import get_model
 from trainer import Trainer
 from utils.tools import set_seed
-from utils.visualization import extract_features  # 复用可视化工具中的特征提取
+from utils.visualization import extract_features, set_style  # 复用
 
 
-# === MMD 计算辅助函数 ===
-def rbf_mmd(X, Y, device, sigma_list=[1.0, 5.0, 10.0]):
+# === 新增：PGFA 物理对齐可视化工具 ===
+def visualize_pgfa_alignment(model, dataloader, device, save_dir):
     """
-    计算 RBF 核的 MMD 距离 (衡量源域和目标域的特征分布差异)
-    X: Source Features [N, D]
-    Y: Target Features [M, D]
+    画出 Mask 和 Spectrum 的叠加图，证明位置对齐。
     """
-    X = torch.tensor(X).to(device)
-    Y = torch.tensor(Y).to(device)
+    model.eval()
+    font_prop = set_style()  # 设置中文字体
+    os.makedirs(save_dir, exist_ok=True)
 
-    m = X.size(0)
-    n = Y.size(0)
+    # 抽取一个 Batch
+    micro, macro, acoustic, speed, y_cls, load = next(iter(dataloader))
+    micro = micro.to(device)
+    speed = speed.to(device)
 
-    # 计算核矩阵
-    xx = torch.mm(X, X.t())
-    yy = torch.mm(Y, Y.t())
-    zz = torch.mm(X, Y.t())
+    # 找一个转速比较典型的样本 (例如最接近 45Hz 的)
+    target_speed = 45.0
+    diff = torch.abs(speed - target_speed)
+    idx = torch.argmin(diff)
 
-    rx = (xx.diag().unsqueeze(0).expand_as(xx))
-    ry = (yy.diag().unsqueeze(0).expand_as(yy))
+    # 获取该样本数据
+    sample_micro = micro[idx]  # [512, 1] (Log Spectrum)
+    sample_speed = speed[idx]  # Scalar (Hz)
 
-    dxx = rx.t() + rx - 2. * xx
-    dyy = ry.t() + ry - 2. * yy
-    dxy = rx.t() + ry - 2. * zz
+    # 1. 计算 PGFA Mask
+    # 我们需要手动调用 model.pgfa 来生成 mask
+    if not hasattr(model, 'pgfa'):
+        print("[Vis] Model has no PGFA module, skipping alignment plot.")
+        return
 
-    XX, YY, XY = (torch.zeros(xx.shape).to(device),
-                  torch.zeros(yy.shape).to(device),
-                  torch.zeros(zz.shape).to(device))
+    with torch.no_grad():
+        # 模拟 forward 过程中的输入
+        # 注意：Mask 是根据 speed 生成的，与输入内容无关，只与频率轴有关
+        # model.pgfa.forward(seasonal, speed) -> return seasonal * (1 + alpha * mask)
+        # 我们想单独把 mask 拿出来。
 
-    for sigma in sigma_list:
-        XX += torch.exp(-0.5 * dxx / sigma)
-        YY += torch.exp(-0.5 * dyy / sigma)
-        XY += torch.exp(-0.5 * dxy / sigma)
+        # 重新生成 Mask (复制 PGFA 内部逻辑)
+        f_axis = model.pgfa.freq_axis.to(device).view(1, -1, 1)  # [1, 512, 1]
+        s = sample_speed.view(1, 1, 1)
+        sigma = model.pgfa.sigma
 
-    return torch.mean(XX + YY - 2. * XY).item()
+        # Gaussian Mask 公式
+        mask = torch.exp(- (f_axis - s) ** 2 / (2 * sigma ** 2)) + \
+               torch.exp(- (f_axis - 2 * s) ** 2 / (2 * sigma ** 2)) + \
+               torch.exp(- (f_axis - 3 * s) ** 2 / (2 * sigma ** 2))
+
+        mask_np = mask.cpu().numpy().flatten()
+
+    # 2. 获取频谱 (Micro Stream)
+    # 输入已经是 Log 谱了，直接画
+    spec_np = sample_micro.cpu().numpy().flatten()
+
+    # 3. 绘图
+    plt.figure(figsize=(10, 4))
+
+    # 双坐标轴：左边频谱，右边 Mask 权重
+    ax1 = plt.gca()
+    ax2 = ax1.twinx()
+
+    # 画频谱
+    freqs = np.linspace(0, 512, len(spec_np))  # 假设 0-512Hz
+    ax1.plot(freqs, spec_np, color='#1f77b4', alpha=0.6, label='Micro-Stream Spectrum (Log)')
+    ax1.set_xlabel('Frequency (Hz)', fontproperties=font_prop, fontsize=12)
+    ax1.set_ylabel('Amplitude (Log)', fontproperties=font_prop, fontsize=12, color='#1f77b4')
+
+    # 画 Mask
+    ax2.plot(freqs, mask_np, color='#d62728', linewidth=2, linestyle='--', label='PGFA Attention Mask')
+    ax2.set_ylabel('Attention Weight', fontproperties=font_prop, fontsize=12, color='#d62728')
+
+    # 标注转速
+    real_speed = sample_speed.item()
+    plt.title(f"PGFA 物理对齐验证 (转速: {real_speed:.1f} Hz)", fontproperties=font_prop, fontsize=14)
+
+    # 图例
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', prop=font_prop)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "Vis_PGFA_Alignment.pdf"))
+    plt.close()
+    print(f">>> [Vis] PGFA Alignment plot saved to {save_dir}/Vis_PGFA_Alignment.pdf")
 
 
-# === 核心消融实验任务 ===
+# === 主消融实验逻辑 ===
 def run_ablation(model_alias, gpu_id=0):
-    # 1. 初始化配置
     config = Ch4Config()
-    config.MODEL_NAME = model_alias  # 这一步很关键，工厂根据这个名字加载不同配置的模型
-
-    # 区分 Checkpoint 目录
+    config.MODEL_NAME = model_alias
     config.CHECKPOINT_DIR = os.path.join("checkpoints_rq3", model_alias)
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-
     set_seed(config.SEED)
     device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
 
     print(f"\n>>> [RQ3] Running: {model_alias}")
 
-    # 2. 准备数据
-    # Source Domain (200kg) 用于训练
+    # 数据 (Shuffle=True for training)
     train_dl = DataLoader(Ch4DualStreamDataset(config, 'train'), batch_size=config.BATCH_SIZE, shuffle=True)
+    test_dl = DataLoader(Ch4DualStreamDataset(config, 'test'), batch_size=config.BATCH_SIZE, shuffle=False)
 
-    # Target Domain (Test set 包含 0kg 和 400kg)
-    test_ds = Ch4DualStreamDataset(config, 'test')
-    test_dl = DataLoader(test_ds, batch_size=config.BATCH_SIZE, shuffle=False)
-
-    # 3. 初始化模型与训练器
+    # 模型
     model = get_model(model_alias, config).to(device)
     trainer = Trainer(config, model, device)
 
-    # 4. 训练阶段 (20 Epochs 足够收敛)
-    print("    Training...")
+    # 训练
     for epoch in range(20):
         trainer.train_epoch(train_dl)
 
-    # 5. 评估阶段 (关注最难的 400kg 变工况)
-    print("    Evaluating...")
-    # 这里的 save_path 生成 csv 用于后续计算 accuracy
-    eval_csv_path = os.path.join(config.CHECKPOINT_DIR, "eval_all.csv")
-    trainer.evaluate(test_dl, save_path=eval_csv_path)
+    # 评估
+    eval_csv = os.path.join(config.CHECKPOINT_DIR, "eval_all.csv")
+    trainer.evaluate(test_dl, save_path=eval_csv)
 
-    # 读取 CSV 计算 Target (400kg) 的精度
-    df = pd.read_csv(eval_csv_path)
-    # Load_kg > 300 即为重载工况
-    df_heavy = df[df['Load_kg'] > 300]
+    # === [Key] 如果是 Phys-RDLinear，画物理对齐图 ===
+    if model_alias == 'Phys-RDLinear':
+        # 用测试集数据画，看看泛化时的 Mask 对不对
+        visualize_pgfa_alignment(model, test_dl, device, config.CHECKPOINT_DIR)
 
-    if len(df_heavy) > 0:
-        acc_target = df_heavy['Is_Correct'].mean() * 100
-    else:
-        acc_target = 0.0
-        print("[Warn] No 400kg samples found in evaluation!")
-
-    # 6. 计算 MMD (核心指标：衡量特征解耦程度)
-    print("    Calculating MMD...")
-
-    # A. 提取源域特征 (Source: 200kg)
-    # 使用 shuffle=False 保证顺序，且只需提取一部分用于计算即可
-    source_eval_dl = DataLoader(Ch4DualStreamDataset(config, 'train'), batch_size=config.BATCH_SIZE, shuffle=False)
-    src_feats, _, _, _ = extract_features(model, source_eval_dl, device)
-
-    # B. 提取目标域特征 (Target)
-    tgt_feats, _, _, tgt_loads = extract_features(model, test_dl, device)
-
-    # C. 筛选出 400kg 的特征用于计算 MMD
-    # 你的 Loader 中 load 被归一化了 (load/400)，所以 400kg 对应 1.0
-    # [修复点] tgt_loads 是 (N, 1)，必须 flatten 成 (N,) 才能作为 mask 索引
-    tgt_mask = (tgt_loads > 0.8).flatten()
-    tgt_feats_heavy = tgt_feats[tgt_mask]
-
-    # D. 执行计算
-    if len(tgt_feats_heavy) > 0:
-        # 为了防止 OOM 和加快速度，只采样前 200 个样本计算 MMD 即可
-        # 只要样本是随机分布的，距离就是统计有效的
-        sample_n = min(200, len(src_feats), len(tgt_feats_heavy))
-        mmd_val = rbf_mmd(src_feats[:sample_n], tgt_feats_heavy[:sample_n], device)
-    else:
-        mmd_val = 999.0
-        print("[Warn] No target samples valid for MMD calculation.")
-
-    print(f"    -> Target Acc (400kg): {acc_target:.2f}%, MMD: {mmd_val:.4f}")
-
-    return {
-        "Model": model_alias,
-        "PGFA": "Yes" if "PGFA" in model_alias or "Phys" in model_alias else "No",
-        "MTL": "Yes" if "MTL" in model_alias or "Phys" in model_alias else "No",
-        "Target Acc (400kg)": acc_target,
-        "MMD Distance": mmd_val
-    }
+    return eval_csv
 
 
-# === 主程序 ===
 if __name__ == "__main__":
-    # 定义要对比的四种配置
-    configs = [
-        'Ablation-Base',  # 无物理引导，无MTL
-        'Ablation-PGFA',  # 有物理引导，无MTL
-        'Ablation-MTL',  # 无物理引导，有MTL
-        'Phys-RDLinear'  # Full Model (Ours)
-    ]
-
-    results = []
-
-    print("\n========================================================")
-    print("   RQ3: Physics-Guided Mechanism Ablation (Start)")
-    print("========================================================")
+    configs = ['Ablation-Base', 'Ablation-PGFA', 'Ablation-MTL', 'Phys-RDLinear']
 
     for c in configs:
-        # 这里串行运行，若 GPU 显存足够可尝试并行
-        try:
-            res = run_ablation(c, gpu_id=0)
-            results.append(res)
-        except Exception as e:
-            print(f"[Error] Failed to run {c}: {e}")
-            import traceback
+        run_ablation(c)
 
-            traceback.print_exc()
-
-    # 生成最终表格
-    if results:
-        df = pd.DataFrame(results)
-        # 保留4位小数展示 MMD，2位小数展示 Acc
-        df['MMD Distance'] = df['MMD Distance'].round(4)
-        df['Target Acc (400kg)'] = df['Target Acc (400kg)'].round(2)
-
-        print("\n========================================================")
-        print("   RQ3: Final Ablation Results")
-        print("========================================================")
-        print(df.to_string(index=False))
-
-        df.to_csv("Table_RQ3_Mechanism_Ablation.csv", index=False)
-        print("\n>>> Table saved to Table_RQ3_Mechanism_Ablation.csv")
-    else:
-        print("No results collected.")
+    print("\n>>> RQ3 All Done.")

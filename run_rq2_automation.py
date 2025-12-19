@@ -1,18 +1,14 @@
 import os
 import torch
 import pandas as pd
-import numpy as np
-import argparse
-import json
 from torch.utils.data import DataLoader
-
 from config import Ch4Config
 from data_loader_ch4 import Ch4DualStreamDataset
 from models.factory import get_model
 from trainer import Trainer
 from utils.tools import set_seed
 
-# 故障类别映射 (用于后续统计特定故障的精度)
+# 故障映射表
 FAULT_MAP = {
     0: 'HH', 1: 'RU', 2: 'RM', 3: 'SW',
     4: 'VU', 5: 'BR', 6: 'KA', 7: 'FB'
@@ -20,16 +16,12 @@ FAULT_MAP = {
 
 
 class AblationTrainer(Trainer):
-    """
-    继承 Trainer，增加致盲功能
-    """
-
     def __init__(self, config, model, device, ablation_mode='none'):
         super().__init__(config, model, device)
-        self.ablation_mode = ablation_mode  # 'none', 'no_micro', 'no_macro'
+        self.ablation_mode = ablation_mode
 
     def _mask_input(self, micro, macro):
-        """核心致盲逻辑"""
+        """ 致盲核心：将不需要的分支置为 0 """
         if self.ablation_mode == 'no_micro':
             micro = torch.zeros_like(micro)
         elif self.ablation_mode == 'no_macro':
@@ -40,16 +32,20 @@ class AblationTrainer(Trainer):
         self.model.train()
         total_loss, correct, total = 0, 0, 0
 
-        for micro_x, macro_x, speed, y_cls, y_load in dataloader:
-            micro_x, macro_x = micro_x.to(self.device), macro_x.to(self.device)
-            speed, y_cls, y_load = speed.to(self.device), y_cls.to(self.device), y_load.to(self.device)
+        # [Fix] 解包 6 个变量
+        for micro, macro, acoustic, speed, y_cls, y_load in dataloader:
+            micro, macro = micro.to(self.device), macro.to(self.device)
+            acoustic, speed = acoustic.to(self.device), speed.to(self.device)
+            y_cls, y_load = y_cls.to(self.device), y_load.to(self.device)
 
-            # --- 致盲 ---
-            micro_x, macro_x = self._mask_input(micro_x, macro_x)
+            # 执行致盲
+            micro, macro = self._mask_input(micro, macro)
 
             self.optimizer.zero_grad()
-            # Phys-RDLinear 接受双流输入
-            logits, pred_load = self.model(micro_x, macro_x, speed)
+            # 我们的模型现在统一接受声纹输入，如果没有声纹实验需求，acoustic 传入即可
+            logits, pred_load = self.model(micro, macro, acoustic, speed)
+
+            # 计算 Loss (支持 MTL)
             loss, _, _ = self.criterion(logits, y_cls, pred_load, y_load)
 
             loss.backward()
@@ -68,72 +64,59 @@ class AblationTrainer(Trainer):
         correct, total = 0, 0
         results = []
 
-        for micro_x, macro_x, speed, y_cls, y_load in dataloader:
-            micro_x, macro_x = micro_x.to(self.device), macro_x.to(self.device)
-            speed, y_cls = speed.to(self.device), y_cls.to(self.device)
+        for micro, macro, acoustic, speed, y_cls, y_load in dataloader:
+            micro, macro = micro.to(self.device), macro.to(self.device)
+            acoustic, speed = acoustic.to(self.device), speed.to(self.device)
 
-            # --- 致盲 ---
-            micro_x, macro_x = self._mask_input(micro_x, macro_x)
+            micro, macro = self._mask_input(micro, macro)
 
-            logits, _ = self.model(micro_x, macro_x, speed)
+            logits, _ = self.model(micro, macro, acoustic, speed)
             preds = torch.argmax(logits, dim=1)
 
             correct += (preds == y_cls).sum().item()
             total += y_cls.size(0)
 
-            # 收集详细结果用于分析
+            # 收集结果
             b_true = y_cls.cpu().numpy()
             b_pred = preds.cpu().numpy()
             for i in range(len(b_true)):
                 results.append({
                     'True_Label': b_true[i],
-                    'Pred_Label': b_pred[i],
                     'Is_Correct': 1 if b_true[i] == b_pred[i] else 0
                 })
 
         if save_path:
             pd.DataFrame(results).to_csv(save_path, index=False)
-
         return 100 * correct / total
 
 
-def run_ablation_task(mode_name, gpu_id):
-    """运行单个消融实验任务"""
-    # 1. 配置
+def run_rq2_task(mode_name, gpu_id=0):
     config = Ch4Config()
-    config.MODEL_NAME = 'Phys-RDLinear'  # 始终使用我们的模型
-    # 区分 Checkpoint 目录
-    config.CHECKPOINT_DIR = os.path.join(config.PROJECT_ROOT, "checkpoints_rq2", mode_name)
+    config.MODEL_NAME = 'Phys-RDLinear'
+    config.CHECKPOINT_DIR = os.path.join("checkpoints_rq2", mode_name)
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-
     set_seed(config.SEED)
     device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
 
     print(f"\n>>> [RQ2] Running Ablation: {mode_name}")
 
-    # 2. 数据
+    # 加载数据
     train_dl = DataLoader(Ch4DualStreamDataset(config, 'train'), batch_size=config.BATCH_SIZE, shuffle=True)
     test_dl = DataLoader(Ch4DualStreamDataset(config, 'test'), batch_size=config.BATCH_SIZE, shuffle=False)
 
-    # 3. 模型
+    # 加载模型
     model = get_model('Phys-RDLinear', config).to(device)
 
-    # 4. 训练器 (带致盲功能)
+    # 训练
     trainer = AblationTrainer(config, model, device, ablation_mode=mode_name)
+    for epoch in range(20):  # 20 Epochs 足够
+        trainer.train_epoch(train_dl)
 
-    # 5. 训练
-    for epoch in range(40):  # 20轮足够收敛
-        metrics = trainer.train_epoch(train_dl)
-        if (epoch + 1) % 5 == 0:
-            print(f"    Epoch {epoch + 1} | Loss: {metrics['loss']:.4f} | Train Acc: {metrics['acc']:.1f}%")
-
-    # 6. 评估
+    # 评估
     csv_path = os.path.join(config.CHECKPOINT_DIR, "eval_results.csv")
     acc = trainer.evaluate(test_dl, save_path=csv_path)
-    print(f"    Eval Acc: {acc:.2f}%")
-
+    print(f"    Finished {mode_name}: Acc {acc:.2f}%")
     return csv_path
-
 
 def analyze_results(csv_paths):
     """分析三个实验的结果，生成包含所有故障类型的对比表格"""
@@ -203,16 +186,10 @@ def analyze_results(csv_paths):
 
 if __name__ == "__main__":
     # 定义三个任务
-    tasks = {
-        'full': 'full',  # 双流
-        'no_micro': 'no_micro',  # 只有全景 (51.2k)
-        'no_macro': 'no_macro'  # 只有显微 (1k)
-    }
+    modes = ['full', 'no_micro', 'no_macro']
 
     results = {}
-    for task_name, mode in tasks.items():
-        # 这里串行运行，如果你有多个GPU可以并行
-        csv = run_ablation_task(mode, gpu_id=0)
-        results[mode] = csv
+    for m in modes:
+        results[m] = run_rq2_task(m)
 
     analyze_results(results)
