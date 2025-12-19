@@ -1,12 +1,9 @@
 import torch
 import numpy as np
-import pandas as pd
 import os
 from torch.utils.data import DataLoader
-from typing import Dict
 from config import Ch4Config
 from utils.uncertainty_loss import UncertaintyLoss
-
 
 class Trainer:
     def __init__(self, config: Ch4Config, model, device: torch.device):
@@ -21,10 +18,11 @@ class Trainer:
             {'params': self.criterion.parameters(), 'lr': 1e-3}
         ], lr=config.LEARNING_RATE)
 
-    # trainer.py 部分代码片段
     def train_epoch(self, dataloader):
         self.model.train()
         total_loss = 0
+        correct = 0
+        total = 0
 
         for batch_idx, (micro, macro, ac, spd, y_cls, y_load) in enumerate(dataloader):
             micro, macro = micro.to(self.device), macro.to(self.device)
@@ -37,23 +35,33 @@ class Trainer:
             if self.config.MODEL_NAME.startswith('Phys') or self.config.MODEL_NAME.startswith('Ablation'):
                 logits, pred_load = self.model(micro, macro, ac, spd)
             else:
-                # Baselines: Concat inputs
+                # Baselines: Concat inputs (Micro + Macro)
+                # 确保基线模型也能处理 spd 输入 (我们在 models/baselines_ch4.py 中已经做了兼容)
                 full_x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
                 logits, pred_load = self.model(full_x, spd)
 
             # Loss Calculation
             if pred_load is not None:
-                # MTL
+                # MTL (Phys-RDLinear 或 Ablation-MTL)
                 loss, l_cls, l_reg = self.criterion(logits, y_cls, pred_load, y_load)
             else:
-                # Single Task
+                # Single Task (Baseline)
                 loss = torch.nn.functional.cross_entropy(logits, y_cls)
 
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
 
-        return {"loss": total_loss / len(dataloader)}
+            # 计算准确率 (修复 KeyError: 'acc')
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == y_cls).sum().item()
+            total += y_cls.size(0)
+
+        # 返回字典，包含 loss 和 acc
+        return {
+            "loss": total_loss / len(dataloader),
+            "acc": 100.0 * correct / total
+        }
 
     @torch.no_grad()
     def evaluate(self, dataloader: DataLoader, save_path: str = None) -> float:
@@ -61,45 +69,34 @@ class Trainer:
         correct, total = 0, 0
         results = []
 
-        for micro_x, macro_x, speed, y_cls, y_load in dataloader:
+        for micro_x, macro_x, ac, speed, y_cls, y_load in dataloader:
             micro_x, macro_x = micro_x.to(self.device), macro_x.to(self.device)
-            speed, y_cls = speed.to(self.device), y_cls.to(self.device)
+            ac, speed = ac.to(self.device), speed.to(self.device)
+            y_cls = y_cls.to(self.device)
 
-            # === [核心修改] 修改判断条件，支持 Ablation 系列模型 ===
-            if self.config.MODEL_NAME.startswith('Phys-RDLinear') or self.config.MODEL_NAME.startswith('Ablation'):
-                # 我们的模型（无论是完整版还是消融版）都需要双流输入
-                logits, _ = self.model(micro_x, macro_x, speed)
+            # Forward logic matching train_epoch
+            if self.config.MODEL_NAME.startswith('Phys') or self.config.MODEL_NAME.startswith('Ablation'):
+                logits, _ = self.model(micro_x, macro_x, ac, speed)
             else:
-                # 基线模型：继续使用拼接输入
-                full_x = torch.cat([micro_x, macro_x], dim=1)
+                full_x = torch.cat([micro_x.squeeze(-1), macro_x.squeeze(-1)], dim=1)
                 logits, _ = self.model(full_x, speed)
 
             preds = torch.argmax(logits, dim=1)
             correct += (preds == y_cls).sum().item()
             total += y_cls.size(0)
 
-            # 收集详细数据 (转回CPU)
-            # 注意：这里我们需要反推 Load 和 Speed 的物理值用于人类可读
-            # y_load 是归一化的，speed 是 Hz
-            b_load = (y_load.cpu().numpy().flatten() * 400).round().astype(int)
-            b_speed = (speed.cpu().numpy().flatten() * 60).round().astype(int)  # 假设传入的是 Hz, *60 变 RPM? 不，你之前代码是 Hz
-            # 你的 Dataset 里 speed_hz = data['speed'] / 60.0，所以这里 *60 还原为 RPM
-            # 或者直接存 Hz。为了报表好看，我们直接用 Dataset 里的原始信息可能更准，
-            # 但这里作为验证，反推即可。
-
+            # 收集结果
             b_true = y_cls.cpu().numpy()
             b_pred = preds.cpu().numpy()
+            b_load = (y_load.cpu().numpy().flatten() * 400).round().astype(int)
 
             for i in range(len(b_true)):
                 results.append({
                     'Load_kg': b_load[i],
-                    'Speed_Hz': b_speed[i],  # 这里的逻辑可能需要根据你 dataset 的归一化调整
                     'True_Label': b_true[i],
                     'Pred_Label': b_pred[i],
                     'Is_Correct': 1 if b_true[i] == b_pred[i] else 0
                 })
-
-
 
         # 保存详细报表
         if save_path:
@@ -109,8 +106,5 @@ class Trainer:
             df.to_csv(save_path, index=False)
             print(f"    -> Detailed report saved to: {os.path.basename(save_path)}")
 
-            # 顺便生成一个按故障类型的统计表
-            cls_report = df.groupby('True_Label')['Is_Correct'].mean()
-            cls_report.to_csv(save_path.replace('.csv', '_per_class.csv'))
-
+        if total == 0: return 0.0
         return 100 * correct / total

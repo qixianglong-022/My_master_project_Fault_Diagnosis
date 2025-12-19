@@ -56,7 +56,11 @@ def run_ch4_experiment():
     # 5. 训练阶段 (Train on Source: 200kg)
     print("\n>>> [Phase 1] Training Source Model...")
 
-    TRAIN_EPOCHS = 55
+    # [修改策略] 针对 ResNet 减少轮数，其他模型保持 55
+    if args.model_name == 'ResNet-18':
+        TRAIN_EPOCHS = 25  # ResNet 收敛很快，10-15轮通常足够看个大概
+    else:
+        TRAIN_EPOCHS = 55
 
     for epoch in range(TRAIN_EPOCHS):
         metrics = trainer.train_epoch(train_dl)
