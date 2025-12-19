@@ -115,45 +115,41 @@ class Config:
 class Ch4Config:
     """第四章：变工况域泛化实验专用配置"""
 
-    # --- 1. 基础路径 (继承自 BasePaths) ---
+    # --- 1. 基础路径 ---
     PROJECT_ROOT: str = Config.PROJECT_ROOT
     DATA_DIR: str = os.path.join(PROJECT_ROOT, "processed_data_ch4_dual_stream")
     CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints_ch4")
 
-    # --- 2. 物理参数 ---
-    FREQ_DIM: int = 512  # 显微流 FFT点数 / 2
-    NUM_CLASSES: int = 8  # 1 正常 + 7 故障
-    SAMPLE_RATE: int = 5120  # 显微流采样率
+    # --- 2. 物理参数 (CRITICAL FIX) ---
+    # 论文 P1: "降采样50倍...分辨率提升至1Hz"
+    # 原始 51200 / 50 = 1024 Hz
+    # 奈奎斯特频率 = 512 Hz -> FFT点数 1024 -> 单边谱 512点
+    FREQ_DIM: int = 512
+    NUM_CLASSES: int = 8
+    SAMPLE_RATE: int = 1024  # [修正] 必须是 1024，否则 PGFA 频率轴对不上
 
     # --- 3. 模型超参 ---
     HIDDEN_DIM: int = 128
-    PGFA_SIGMA: float = 3.0  # PGFA 高斯掩码带宽
+    PGFA_SIGMA: float = 2.0  # 稍微调小一点，让物理掩膜更尖锐
 
     # --- 4. 训练参数 ---
     BATCH_SIZE: int = 16
-    EPOCHS: int = 100
-    LEARNING_RATE: float = 1e-3
+    EPOCHS: int = 60         # 小样本收敛快，60足够
+    LEARNING_RATE: float = 2e-3 # 稍微加大初始LR
     SEED: int = 42
 
-    # --- 5. 实验协议 (Domain Generalization Protocol) ---
-    # 核心逻辑：源域训练，目标域测试
-
-    # 源域 (Train): 仅使用 200kg (半载)
-    # 转速: 仅覆盖 4 种基础转速 (15, 45, 15-45, 45-15)
+    # --- 5. 实验协议 (单源域泛化) ---
+    # Train: 200kg (Source)
     TRAIN_LOADS: List[int] = field(default_factory=lambda: [200])
     TRAIN_SPEEDS: List[str] = field(default_factory=lambda: ['15', '45', '15-45', '45-15'])
 
-    # 目标域 (Test): 使用 0kg (空载) 和 400kg (满载)
-    # 转速: 外推至全量 8 种转速 (包含未见的 30Hz, 60Hz 及其瞬态)
+    # Test: 0kg & 400kg (Target)
     TEST_LOADS: List[int] = field(default_factory=lambda: [0, 400])
     TEST_SPEEDS: List[str] = field(default_factory=lambda: [
         '15', '30', '45', '60',
         '15-45', '30-60', '45-15', '60-30'
     ])
 
-    # 映射表 (文件名 ID -> 物理含义)
-    # Load: 0->0, 2->200, 4->400
-    # Speed: 1->15, 2->30, 3->45, 4->60 ...
     SPEED_ID_MAP = {
         '1': '15', '2': '30', '3': '45', '4': '60',
         '5': '15-45', '6': '30-60', '7': '45-15', '8': '60-30'

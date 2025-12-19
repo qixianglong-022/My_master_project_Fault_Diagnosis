@@ -1,42 +1,80 @@
+# models/baselines_ch4.py
 import torch
 import torch.nn as nn
-from torchvision.models import resnet18, ResNet18_Weights
+
+
+class ResBlock1D(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels)
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
 
 
 class ResNet18_1D(nn.Module):
     """
-    [公平基线] 将 ResNet-18 修改为 1D 卷积版本，
-    或者将输入视为 (1, H, W) 的单通道图像 (Spectrogram)。
-    这里为了最简单且公平，我们使用 1D 卷积重写第一层，
-    保留后续 2D 结构（将 Time 视为 Width, Feature=1 视为 Height）。
+    [公平基线] 原生 1D ResNet-18
+    不做 Reshape，直接在频域上卷。
     """
 
     def __init__(self, num_classes=8, input_len=1024):
         super().__init__()
-        # 加载预训练权重
-        self.backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        self.in_channels = 64
 
-        # 修改第一层：适应单通道输入
-        # 原始: Conv2d(3, 64, 7x7)
-        # 修改: Conv2d(1, 64, 7x7)
-        old_w = self.backbone.conv1.weight.data
-        new_w = old_w.mean(dim=1, keepdim=True)  # RGB 平均
-        self.backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.backbone.conv1.weight.data = new_w
+        # Stem
+        self.conv1 = nn.Conv1d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
-        # 修改全连接层
-        self.backbone.fc = nn.Linear(512, num_classes)
+        # Stages
+        self.layer1 = self._make_layer(64, 2, stride=1)
+        self.layer2 = self._make_layer(128, 2, stride=2)
+        self.layer3 = self._make_layer(256, 2, stride=2)
+        self.layer4 = self._make_layer(512, 2, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(512, num_classes)
+
+    def _make_layer(self, out_channels, blocks, stride):
+        layers = []
+        layers.append(ResBlock1D(self.in_channels, out_channels, stride))
+        self.in_channels = out_channels
+        for _ in range(1, blocks):
+            layers.append(ResBlock1D(out_channels, out_channels))
+        return nn.Sequential(*layers)
 
     def forward(self, x, speed=None):
-        # x: [B, 1024] -> Reshape to [B, 1, 32, 32]
-        # 虽然这破坏了物理邻域，但这是 CV 模型处理 1D 信号最常见的 Baseline 方法
-        B = x.size(0)
-        # 补齐到 1024 (如果不足)
-        if x.size(1) != 1024:
-            x = torch.nn.functional.pad(x, (0, 1024 - x.size(1)))
+        # x: [B, L] -> [B, 1, L]
+        x = x.unsqueeze(1)
 
-        x_img = x.view(B, 1, 32, 32)
-        return self.backbone(x_img), None
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = x.flatten(1)
+        return self.fc(x), None
 
 
 class FD_CNN(nn.Module):
