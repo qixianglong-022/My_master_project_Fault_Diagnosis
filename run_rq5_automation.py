@@ -10,18 +10,36 @@ from utils.tools import set_seed
 
 class NoiseInjector:
     @staticmethod
-    def add_noise(tensor, snr_db):
-        if snr_db is None: return tensor
-        # 计算信号功率 (Log谱下需要小心，假设 tensor 是 exp 后的幅度？不，现在 tensor 是 log1p)
-        # 直接在 Log 域加高斯噪声其实是在模拟乘性噪声，
-        # 但为了简单且符合深度学习惯例，我们直接加加性噪声。
-        # 更好的做法：转回线性域 -> 加噪 -> 转回 Log 域。
+    def add_noise(tensor_log, snr_db):
+        """
+        [物理修正]
+        输入 tensor_log 是 log1p 后的幅值谱。
+        必须还原到线性域加噪，再变换回来，才是真正的加性高斯白噪 (AWGN)。
+        """
+        if snr_db is None: return tensor_log
 
-        # 简易版：直接加噪声
-        sig_std = torch.std(tensor)
-        noise_std = sig_std / (10 ** (snr_db / 20))  # 20log10(sig/noise) = SNR
-        noise = torch.randn_like(tensor) * noise_std
-        return tensor + noise
+        device = tensor_log.device
+
+        # 1. 反 Log 变换 (还原线性幅值)
+        # y = log1p(x) -> x = exp(y) - 1
+        sig_linear = torch.expm1(tensor_log)
+
+        # 2. 计算信号功率 (平均能量)
+        sig_power = torch.mean(sig_linear ** 2)
+
+        # 3. 计算噪声功率
+        noise_power = sig_power / (10 ** (snr_db / 10))
+        noise_std = torch.sqrt(noise_power)
+
+        # 4. 生成噪声 (保证非负，因为幅值谱非负)
+        noise = torch.randn_like(sig_linear) * noise_std
+
+        # 5. 加噪 (注意：幅值谱叠加是向量叠加，简单近似为幅值相加可能会有相位误差，
+        # 但在仅有幅值谱的情况下，这是标准做法。取绝对值防止负数)
+        noisy_linear = torch.abs(sig_linear + noise)
+
+        # 6. 转回 Log 域
+        return torch.log1p(noisy_linear)
 
 
 def run_rq5_experiments():

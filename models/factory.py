@@ -38,8 +38,10 @@ def get_model(model_name: str, config: Ch4Config):
         return TiDE_Cls(num_classes=config.NUM_CLASSES, freq_dim=FULL_DIM)
 
     elif model_name == 'ResNet-18':
-        # ResNet 需要知道总长度来 reshape
-        return ResNet18_Thin(num_classes=config.NUM_CLASSES, input_len=FULL_DIM)
+
+        from models.baselines_ch4 import ResNet18_2D
+
+        return ResNet18_2D(num_classes=config.NUM_CLASSES, input_len=FULL_DIM)
 
     elif model_name == 'Vanilla RDLinear':
         return Vanilla_RDLinear_Cls(num_classes=config.NUM_CLASSES, freq_dim=FULL_DIM)

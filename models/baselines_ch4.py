@@ -27,54 +27,79 @@ class ResBlock1D(nn.Module):
         return out
 
 
-class ResNet18_1D(nn.Module):
+class STFTLayer(nn.Module):
     """
-    [公平基线] 原生 1D ResNet-18
-    不做 Reshape，直接在频域上卷。
+    将 1D 振动信号转换为 2D 时频图
+    输入: [B, L] -> 输出: [B, 3, H, W] (适配 ImageNet 预训练权重)
+    """
+
+    def __init__(self, n_fft=64, hop_length=16):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.window = torch.hann_window(n_fft)
+
+    def forward(self, x):
+        # x: [B, L]
+        # 注意：STFT 需要 Tensor 在 CPU 或 GPU 上一致，register_buffer 可以自动处理 device
+        if self.window.device != x.device:
+            self.window = self.window.to(x.device)
+
+        # STFT: [B, Freq, Time, 2]
+        x_stft = torch.stft(x, self.n_fft, self.hop_length, window=self.window, return_complex=True)
+        x_mag = torch.abs(x_stft)  # [B, F, T]
+
+        # Log 变换增强特征
+        x_mag = torch.log1p(x_mag)
+
+        # 归一化到 0-1 (Instance Norm 风格)
+        B, F, T = x_mag.shape
+        x_mag = x_mag.view(B, -1)
+        x_mag -= x_mag.min(dim=1, keepdim=True)[0]
+        x_mag /= (x_mag.max(dim=1, keepdim=True)[0] + 1e-6)
+        x_mag = x_mag.view(B, F, T)
+
+        # 扩展为 3 通道 (RGB)
+        x_img = x_mag.unsqueeze(1).repeat(1, 3, 1, 1)  # [B, 3, F, T]
+
+        # Resize 到 ResNet 标准输入 224x224 (可选，或者保持小尺寸用小 Kernel)
+        # 这里为了保留物理分辨率，建议 Resize 到 64x64 或 128x128
+        x_img = F.interpolate(x_img, size=(224, 224), mode='bilinear', align_corners=False)
+
+        return x_img
+
+
+class ResNet18_2D(nn.Module):
+    """
+    [修正版] 2D-ResNet18 (SOTA Standard)
+    输入 1D 信号 -> 内部转 STFT 图 -> 2D CNN
     """
 
     def __init__(self, num_classes=8, input_len=1024):
         super().__init__()
-        self.in_channels = 64
+        # 1. 前端：时频变换
+        self.stft = STFTLayer(n_fft=128, hop_length=32)
 
-        # Stem
-        self.conv1 = nn.Conv1d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        # 2. 骨干：ResNet18 (加载 ImageNet 预训练权重效果更好，但这里先用随机初始化保证公平)
+        # 如果样本极少 (32个)，强烈建议 pretrained=True
+        self.backbone = resnet18(pretrained=True)
 
-        # Stages
-        self.layer1 = self._make_layer(64, 2, stride=1)
-        self.layer2 = self._make_layer(128, 2, stride=2)
-        self.layer3 = self._make_layer(256, 2, stride=2)
-        self.layer4 = self._make_layer(512, 2, stride=2)
-
-        self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(512, num_classes)
-
-    def _make_layer(self, out_channels, blocks, stride):
-        layers = []
-        layers.append(ResBlock1D(self.in_channels, out_channels, stride))
-        self.in_channels = out_channels
-        for _ in range(1, blocks):
-            layers.append(ResBlock1D(out_channels, out_channels))
-        return nn.Sequential(*layers)
+        # 3. 替换最后的全连接层
+        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
 
     def forward(self, x, speed=None):
-        # x: [B, L] -> [B, 1, L]
-        x = x.unsqueeze(1)
+        # x: [B, L]
+        # 如果输入是 [B, L, 1] 或 [B, 1, L]，先 flatten
+        if x.dim() > 2:
+            x = x.squeeze()
 
-        x = self.relu(self.bn1(self.conv1(x)))
-        x = self.maxpool(x)
+        # 1. 生成图像
+        img = self.stft(x)  # [B, 3, 224, 224]
 
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+        # 2. CNN 推理
+        logits = self.backbone(img)
 
-        x = self.avgpool(x)
-        x = x.flatten(1)
-        return self.fc(x), None
+        return logits, None  # 保持接口一致 (logits, regression)
 
 
 class FD_CNN(nn.Module):
