@@ -78,30 +78,43 @@ class ResNet18_1D(nn.Module):
 
 
 class FD_CNN(nn.Module):
-    """纯频域 1D-CNN"""
+    """
+    [基线修正] 增强版 1D-CNN
+    增加 Dropout 和 Global Average Pooling，防止在小样本上过拟合。
+    """
 
     def __init__(self, num_classes=8, freq_dim=1024):
         super().__init__()
         self.net = nn.Sequential(
-            # 大核卷积提取宽带特征
+            # Layer 1: 大感受野，提取宽带特征
             nn.Conv1d(1, 16, kernel_size=64, stride=4, padding=30),
-            nn.BatchNorm1d(16), nn.ReLU(),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
             nn.MaxPool1d(2),
+            nn.Dropout(0.2),  # [新增]
 
-            nn.Conv1d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32), nn.ReLU(),
+            # Layer 2
+            nn.Conv1d(16, 32, kernel_size=16, stride=1, padding='same'),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
             nn.MaxPool1d(2),
+            nn.Dropout(0.2),  # [新增]
 
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64), nn.ReLU(),
+            # Layer 3
+            nn.Conv1d(32, 64, kernel_size=3, stride=1, padding='same'),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+
+            # Global Avg Pool: 替代 Flatten，允许输入长度变化，且参数更少
             nn.AdaptiveAvgPool1d(1)
         )
         self.fc = nn.Linear(64, num_classes)
 
     def forward(self, x, speed=None):
         # x: [B, 1024] -> [B, 1, 1024]
-        x = x.unsqueeze(1)
-        feat = self.net(x).squeeze(-1)
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        feat = self.net(x).squeeze(-1)  # [B, 64]
         return self.fc(feat), None
 
 

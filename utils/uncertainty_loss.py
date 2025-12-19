@@ -1,37 +1,38 @@
 import torch
 import torch.nn as nn
-from typing import Tuple
 
 
 class UncertaintyLoss(nn.Module):
     """
-    Multi-task loss with homoscedastic uncertainty weighting.
-    Loss = 1/(2*sigma^2) * L + log(sigma)
+    [数值修正] 稳定的同方差不确定性损失
     """
 
     def __init__(self):
         super().__init__()
-        # Initialize log variance (s = log(sigma^2)) for numerical stability
-        self.s_cls = nn.Parameter(torch.zeros(1))
-        self.s_reg = nn.Parameter(torch.zeros(1))
+        # 初始化为 -2.0 (对应 sigma ≈ 0.36)，给 Loss 一个较大的初始权重，加速收敛
+        self.s_cls = nn.Parameter(torch.tensor(-2.0))
+        self.s_reg = nn.Parameter(torch.tensor(-2.0))
 
-        self.cls_loss_fn = nn.CrossEntropyLoss()
-        self.reg_loss_fn = nn.MSELoss()
+        self.cls_loss = nn.CrossEntropyLoss()
+        self.reg_loss = nn.MSELoss()
 
-    def forward(self,
-                pred_cls: torch.Tensor, target_cls: torch.Tensor,
-                pred_load: torch.Tensor, target_load: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
-        # Calculate raw losses
-        L_cls = self.cls_loss_fn(pred_cls, target_cls)
-        L_reg = self.reg_loss_fn(pred_load, target_load)
+    def forward(self, pred_cls, target_cls, pred_load, target_load):
+        # 1. 计算原始 Loss
+        loss_cls = self.cls_loss(pred_cls, target_cls)
+        loss_reg = self.reg_loss(pred_load, target_load)
 
-        # Adaptive Weighting
-        # exp(-s) represents precision (1/variance)
-        loss = (torch.exp(-self.s_cls) * L_cls + 0.5 * self.s_cls) + \
-               (torch.exp(-self.s_reg) * L_reg + 0.5 * self.s_reg)
+        # 2. 计算不确定性权重
+        # 使用 exp(-s) 作为精度 (Precision)
+        # 这里的 s 实际上是 log(sigma^2)
 
-        return loss, L_cls.item(), L_reg.item()
+        # 策略：限制 s 的范围，防止除以 0 或权重过大
+        # 简单公式: Loss = exp(-s) * L + 0.5 * s
 
-    def get_weights(self) -> Tuple[float, float]:
-        """Returns current weights for monitoring: w = exp(-s)"""
-        return torch.exp(-self.s_cls).item(), torch.exp(-self.s_reg).item()
+        w_cls = torch.exp(-self.s_cls)
+        w_reg = torch.exp(-self.s_reg)
+
+        # [关键] 加上 0.5 * s 是正则项，防止模型通过无限增大 s (即增大 sigma) 来作弊降低 Loss
+        total_loss = (w_cls * loss_cls + 0.5 * self.s_cls) + \
+                     (w_reg * loss_reg + 0.5 * self.s_reg)
+
+        return total_loss, loss_cls.item(), loss_reg.item()
