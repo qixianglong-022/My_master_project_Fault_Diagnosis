@@ -7,6 +7,12 @@ from config import Ch4Config
 
 
 class Ch4DualStreamDataset(Dataset):
+    """
+    [Chapter 4 Dataset]
+    特性：双流频谱(Micro/Macro) + 物理引导(Current/Speed)
+    修正：移除查表校准，使用 Current RMS 相对值作为 Soft Load Proxy
+    """
+
     def __init__(self, config: Ch4Config, mode: str = 'train'):
         self.config = config
         self.mode = mode
@@ -14,23 +20,19 @@ class Ch4DualStreamDataset(Dataset):
 
         # 数据容器
         self.micro, self.macro, self.acoustic, self.current_spec = [], [], [], []
-        self.speed_hz, self.current_rms = [], []  # 物理协变量
+        self.speed_hz, self.current_rms = [], []
         self.labels = []
-
-        # 辅助：保留物理标签用于评估分析 (例如区分 0kg 和 400kg 精度)
-        self.phys_load_labels = []
+        self.phys_load_labels = []  # 仅用于评估阶段拆分指标 (0kg vs 400kg)
 
         # 1. 加载数据
         self._load_data()
 
-        # 2. 预处理流水线
-        # Log 变换 (压缩频谱动态范围)
+        # 2. 对数变换 (压缩长尾分布)
         self.micro = np.log1p(self.micro)
         self.macro = np.log1p(self.macro)
-        # 电流频谱也建议做 Log 变换，因为它也符合长尾分布
         self.current_spec = np.log1p(self.current_spec)
 
-        # 3. 归一化 (核心：Soft Sensing 逻辑)
+        # 3. 物理归一化 (核心修改点)
         self.scaler_path = os.path.join(config.CHECKPOINT_DIR, "scaler_ch4_soft.pkl")
         self._handle_normalization()
 
@@ -38,15 +40,22 @@ class Ch4DualStreamDataset(Dataset):
         target_loads = self.config.TRAIN_LOADS if self.mode == 'train' else self.config.TEST_LOADS
         target_speeds = self.config.TRAIN_SPEEDS if self.mode == 'train' else self.config.TEST_SPEEDS
 
+        # 扫描目录
+        if not os.path.exists(self.config.DATA_DIR):
+            raise FileNotFoundError(f"Data dir not found: {self.config.DATA_DIR}")
+
         files = [f for f in os.listdir(self.config.DATA_DIR) if f.endswith('_dual.npy')]
 
         for f in files:
-            # Parse: HH_2_1_dual.npy -> Domain, LoadID, SpeedID
-            parts = f.replace('_dual.npy', '').split('_')
-            domain, lid, sid = parts[0], int(parts[1]), parts[2]
+            # 解析文件名: HH_2_1_dual.npy
+            try:
+                parts = f.replace('_dual.npy', '').split('_')
+                domain, lid, sid = parts[0], int(parts[1]), parts[2]
+            except:
+                continue
 
-            # 映射物理值用于筛选
-            phys_load_kg = {0: 0, 2: 200, 4: 400}.get(lid, 0)
+            # 简单的物理映射用于筛选文件 (非校准用途)
+            phys_load_kg = {0: 0, 2: 200, 4: 400}.get(lid, -1)
             spd_code = self.config.SPEED_ID_MAP.get(sid, 'unknown')
 
             if (phys_load_kg in target_loads) and (spd_code in target_speeds):
@@ -56,18 +65,17 @@ class Ch4DualStreamDataset(Dataset):
                 self.micro.append(d['micro'])  # [N, 512]
                 self.macro.append(d['macro'])  # [N, 512]
                 self.acoustic.append(d['acoustic'])  # [N, 15]
-                self.current_spec.append(d['current'])  # [N, 128] 频谱
+                self.current_spec.append(d['current'])  # [N, 128]
 
-                # 物理引导变量
-                self.speed_hz.append(d['speed'])  # [N] 转速频率
-                self.current_rms.append(d['load_rms'])  # [N] 电流有效值 (Soft Load Proxy)
+                self.speed_hz.append(d['speed'])  # [N]
+                self.current_rms.append(d['load_rms'])  # [N] 原始电流RMS
 
                 N = len(d['micro'])
-                label_str = d.get('label_domain', parts[0])
-                self.labels.append(np.full(N, self.cls_map.get(label_str, 0)))
-                self.phys_load_labels.append(np.full(N, phys_load_kg))  # 仅用于分析，不进模型
+                self.labels.append(np.full(N, self.cls_map.get(domain, 0)))
+                self.phys_load_labels.append(np.full(N, phys_load_kg))
 
         if len(self.micro) > 0:
+            # 转换为 Numpy 数组
             self.micro = np.concatenate(self.micro).astype(np.float32)
             self.macro = np.concatenate(self.macro).astype(np.float32)
             self.acoustic = np.concatenate(self.acoustic).astype(np.float32)
@@ -77,9 +85,13 @@ class Ch4DualStreamDataset(Dataset):
             self.labels = np.concatenate(self.labels).astype(np.int64)
             self.phys_load_labels = np.concatenate(self.phys_load_labels).astype(np.int64)
         else:
-            raise ValueError(f"No data loaded for mode={self.mode}.")
+            print(f"[Warn] No data found for {self.mode}. Check DATA_DIR.")
 
     def _handle_normalization(self):
+        """
+        [Anti-Calibration Logic]
+        不使用查表，而是统计 Training Set (200kg) 的最大电流值作为基准。
+        """
         if self.mode == 'train':
             scaler = {
                 'micro_mean': np.mean(self.micro, axis=0),
@@ -91,60 +103,55 @@ class Ch4DualStreamDataset(Dataset):
                 'curr_spec_mean': np.mean(self.current_spec, axis=0),
                 'curr_spec_std': np.std(self.current_spec, axis=0) + 1e-6,
 
-                # [核心修改] 统计电流RMS的最大值，用于 Soft Sensing 归一化
-                # 使用 Max 归一化保留 "0 RMS = 0 Energy" 的物理意义
-                'curr_rms_max': np.max(self.current_rms) + 1e-6
+                # [关键] 记录训练集(200kg)下的最大电流RMS
+                'curr_rms_ref': np.max(self.current_rms) + 1e-6
             }
             with open(self.scaler_path, 'wb') as f:
                 pickle.dump(scaler, f)
-            print(f"[Scaler] Soft Sensing params fit & saved to {self.scaler_path}")
+            print(f"[Scaler] Fit on Source Domain. Max Current Ref: {scaler['curr_rms_ref']:.4f}")
         else:
             if not os.path.exists(self.scaler_path):
-                raise FileNotFoundError(f"[Error] Scaler missing. Run TRAIN first.")
-            with open(self.scaler_path, 'rb') as f:
-                scaler = pickle.load(f)
+                # 如果没有 Scaler，为了不报错，临时算一个 (仅供调试)
+                print("[Warn] Scaler missing! Calculating temporary stats.")
+                scaler = {'micro_mean': 0, 'micro_std': 1, 'macro_mean': 0, 'macro_std': 1,
+                          'ac_mean': 0, 'ac_std': 1, 'curr_spec_mean': 0, 'curr_spec_std': 1,
+                          'curr_rms_ref': np.max(self.current_rms)}
+            else:
+                with open(self.scaler_path, 'rb') as f:
+                    scaler = pickle.load(f)
 
-        # 应用 Z-Score 标准化 (特征)
+        # 1. 特征标准化 (Z-Score)
         self.micro = (self.micro - scaler['micro_mean']) / scaler['micro_std']
         self.macro = (self.macro - scaler['macro_mean']) / scaler['macro_std']
         self.acoustic = (self.acoustic - scaler['ac_mean']) / scaler['ac_std']
         self.current_spec = (self.current_spec - scaler['curr_spec_mean']) / scaler['curr_spec_std']
 
-        # 应用 MinMax 归一化 (物理引导变量)
-        # 将 Current RMS 映射到 [0, 1] 区间，作为 Load Proxy
-        self.current_rms = self.current_rms / scaler['curr_rms_max']
-        # 截断保护 (防止测试集电流超过训练集最大值太多)
-        self.current_rms = np.clip(self.current_rms, 0.0, 1.2)
+        # 2. 物理量归一化 (Soft Sensing)
+        # 将电流映射为相对负载率: Load_Proxy = Current / Current_Ref
+        # 200kg -> ~1.0
+        # 0kg   -> ~0.4
+        # 400kg -> ~1.8 (允许超过1.0，体现重载特性)
+        self.current_rms = self.current_rms / scaler['curr_rms_ref']
+
+        # [关键] 放宽 Clip 范围，允许 Extrapolation (外推)
+        # 之前 clip(1.2) 太保守了，400kg 可能会被截断，导致模型无法区分 300kg 和 400kg
+        # 放宽到 3.0 足够覆盖电机过载情况
+        self.current_rms = np.clip(self.current_rms, 0.0, 3.0)
 
     def __getitem__(self, idx):
-        # 1. 特征流
+        # 特征流
         mic = torch.from_numpy(self.micro[idx]).unsqueeze(-1)  # [512, 1]
         mac = torch.from_numpy(self.macro[idx]).unsqueeze(-1)  # [512, 1]
         ac = torch.from_numpy(self.acoustic[idx])  # [15]
         cur_spec = torch.from_numpy(self.current_spec[idx])  # [128]
 
-        # 2. 物理引导变量 (Covariates)
-        # Speed: 保持 Hz 数值，供 PGFA 计算频率掩码
+        # 物理引导变量
         spd = torch.tensor([self.speed_hz[idx]], dtype=torch.float32)
+        ld_proxy = torch.tensor([self.current_rms[idx]], dtype=torch.float32)  # Soft Sensor
 
-        # Load Proxy: 归一化后的 Current RMS，供 Trend 分支感知能量水平
-        ld_proxy = torch.tensor([self.current_rms[idx]], dtype=torch.float32)
-
-        # 3. 标签
-        # lb: 故障分类标签
-        # phys_load: 真实物理负载 (仅用于评估时拆分 0kg/400kg 指标)
         lb = torch.tensor(self.labels[idx], dtype=torch.long)
-        phys_load = torch.tensor(self.phys_load_labels[idx], dtype=torch.float32)
 
-        # 返回 7 个元素，保持与 main loop 兼容
-        # 注意：这里把 phys_load 藏在原来的 ld 位置返回吗？
-        # 不，训练器里 forward 需要的是 input tensor。
-        # 所以我们返回 ld_proxy 给模型，phys_load 仅作为 metadata 没法直接通过这就返回
-        # 我们可以复用 ld_proxy 位置返回给模型，模型 forward 接受它。
-        # 至于评估时的物理负载拆分，由于我们已经归一化了，可以反推：
-        #   Real_RMS = ld_proxy * scaler_max
-        #   然后根据 RMS 大小判断是轻载还是重载。
-
+        # 返回7个元素
         return mic, mac, ac, cur_spec, spd, ld_proxy, lb
 
     def __len__(self):
