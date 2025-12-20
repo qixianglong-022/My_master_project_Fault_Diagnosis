@@ -121,9 +121,9 @@ class Ch4Config:
     # --- 1. 路径配置 ---
     PROJECT_ROOT: str = Config.PROJECT_ROOT
     # 数据存放目录 (预处理后的 .npy)
-    DATA_DIR: str = os.path.join(PROJECT_ROOT, "processed_data_ch4_v2")
+    DATA_DIR: str = os.path.join(PROJECT_ROOT, "processed_data_ch4")
     # 权重保存目录
-    CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints_ch4_final")
+    CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints_ch4")
 
     # --- 2. 物理通道定义 ---
     # 根据你的硬件连接修改这里
@@ -159,7 +159,7 @@ class Ch4Config:
     TRAIN_SPEEDS: List[str] = field(default_factory=lambda: ['15', '45', '15-45', '45-15'])
 
     # 目标域: 0kg (空载) & 400kg (满载)
-    TEST_LOADS: List[int] = field(default_factory=lambda: [0, 400])
+    TEST_LOADS: List[int] = field(default_factory=lambda: [0, 200, 400])
     TEST_SPEEDS: List[str] = field(default_factory=lambda: [
         '15', '30', '45', '60',
         '15-45', '30-60', '45-15', '60-30'

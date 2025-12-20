@@ -7,51 +7,6 @@ import torch.nn.functional as F
 # 1. 辅助模块 (STFT, ResBlock)
 # ==============================================================================
 
-class STFTLayer(nn.Module):
-    """
-    将 1D 振动信号转换为 2D 时频图
-    输入: [B, L] -> 输出: [B, 3, 224, 224] (适配 ResNet 输入)
-    """
-
-    def __init__(self, n_fft=64, hop_length=16):
-        super().__init__()
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.register_buffer('window', torch.hann_window(n_fft))
-
-    def forward(self, x):
-        # x: [B, L]
-        # STFT: [B, Freq, Time, 2] (Complex)
-        x_stft = torch.stft(x, self.n_fft, self.hop_length, window=self.window, return_complex=True)
-        x_mag = torch.abs(x_stft)  # [B, F, T]
-
-        # Log 变换增强特征
-        x_mag = torch.log1p(x_mag)
-
-        # [修复点] 使用 Freq_Dim 避免覆盖 F (torch.nn.functional)
-        B, Freq_Dim, T = x_mag.shape
-
-        # === [CRITICAL FIX] ===
-        # 原代码: x_mag = x_mag.view(B, -1) -> 报错 RuntimeError
-        # 修改为: .reshape(B, -1)
-        x_mag = x_mag.reshape(B, -1)
-        # ======================
-
-        x_mag -= x_mag.min(dim=1, keepdim=True)[0]
-        x_mag /= (x_mag.max(dim=1, keepdim=True)[0] + 1e-6)
-
-        # 还原回 [B, F, T]
-        x_mag = x_mag.reshape(B, Freq_Dim, T)
-
-        # 扩展为 3 通道 (RGB)
-        x_img = x_mag.unsqueeze(1).repeat(1, 3, 1, 1)  # [B, 3, F, T]
-
-        # Resize 到 224x224 (为了适配标准 ResNet 感受野)
-        x_img = F.interpolate(x_img, size=(224, 224), mode='bilinear', align_corners=False)
-
-        return x_img
-
-
 # ==============================================================================
 # 2. 手写标准 ResNet-18 (移除 torchvision 依赖)
 # ==============================================================================
@@ -152,17 +107,57 @@ def resnet18_custom(num_classes=8):
 # 3. 封装好的模型类 (供 factory 调用)
 # ==============================================================================
 
+# models/baselines_ch4.py
+
 class ResNet18_2D(nn.Module):
     def __init__(self, num_classes=8, input_len=1024):
         super().__init__()
-        self.stft = STFTLayer(n_fft=128, hop_length=32)
+        # 论文中 ResNet 输入是 2D 频谱图 (32x16=512)
+        # 假设 input_len 是 512+512=1024 (Micro+Macro)，这里我们只取 Micro 512 或者都需要适配
+        # 按照论文，通常只用 Vibrartion Spectrum (512)
+
+        # 这里的 backbone 第一层 conv1 接受 3通道，我们需要适配一下
         self.backbone = resnet18_custom(num_classes=num_classes)
 
+        # 替换第一层卷积以接受 1通道 (灰度图) 或者是将输入复制为3通道
+        # 简单起见，我们在 forward 里把输入复制成 3 通道
+
     def forward(self, x, speed=None):
-        if x.dim() > 2: x = x.reshape(x.size(0), -1)
-        img = self.stft(x)
+        # [修复开始] -------------------------
+        # 1. 检查输入维度
+        # 如果输入是 [Batch, Length, 1] (3D)，则压缩掉最后一个维度变成 [Batch, Length]
+        if x.dim() == 3:
+            x = x.squeeze(-1)
+
+        # 2. 现在 x 的形状不仅是安全的 [Batch, Length]，而且可以直接解包
+        B, L = x.shape
+        # [修复结束] -------------------------
+
+        # 以下逻辑保持原样
+        # 假设我们只取前 512 点构建图像 (32x16)
+        # 如果长度不够 512 (例如是电流)，需要 Pad，如果超长则截断
+        target_len = 512
+        if L > target_len:
+            x = x[:, :target_len]
+        elif L < target_len:
+            # 简单的补零逻辑，防止崩溃
+            pad_len = target_len - L
+            x = F.pad(x, (0, pad_len))
+
+        # 重新获取截断后的长度（现在肯定是 512）
+        # Reshape 为图像: [B, 1, 16, 32]
+        img = x.view(B, 1, 16, 32)
+
+        # 复制为 3 通道以适配 ResNet
+        img = img.repeat(1, 3, 1, 1)
+
+        # 上采样到 64x64 以避免特征图过小
+        img = F.interpolate(img, size=(64, 64), mode='bilinear')
+
         logits = self.backbone(img)
-        return logits, None
+
+        # ResNet 基线通常不返回 loss dict，只返回 logits
+        return logits
 
 
 class FD_CNN(nn.Module):
@@ -179,9 +174,33 @@ class FD_CNN(nn.Module):
         self.fc = nn.Linear(64, num_classes)
 
     def forward(self, x, speed=None):
-        if x.dim() == 2: x = x.unsqueeze(1)
-        feat = self.net(x).squeeze(-1)
-        return self.fc(feat), None
+        # x shape: [Batch, Length, 1] (例如 [64, 512, 1])
+        # 或者可能是 [Batch, Length] (如果被 squeeze 过)
+
+        # 1. 维度处理：确保形状为 [Batch, 1, Length] 以适配 Conv1d
+        if x.dim() == 2:
+            # 如果是 [B, L]，扩展为 [B, 1, L]
+            x = x.unsqueeze(1)
+        elif x.dim() == 3:
+            # 如果是 [B, L, 1]，我们需要把最后一维换到中间 -> [B, 1, L]
+            x = x.permute(0, 2, 1)
+
+        # 2. 此时 x 为 [64, 1, 512]，完全符合 Conv1d 要求
+        feat = self.net(x)
+
+        # 3. 后续处理 (Flatten 等)
+        # 这里的 squeeze 视你的 net 结构而定，通常 Conv1d 输出是 [B, C_out, L_out]
+        # 如果最后接的是 Flatten + Linear，可能不需要 squeeze，或者 net 里包含了 Flatten
+        # 假设 self.net 输出已经是 [B, Features]，则直接返回
+
+        # 为了保险，看一眼原本代码里的操作。通常是：
+        # feat = self.net(x) -> [B, 128, 1] (经过 GlobalAvgPool)
+        # feat = feat.squeeze(-1) -> [B, 128]
+        if feat.dim() == 3:
+            feat = feat.squeeze(-1)
+
+        logits = self.fc(feat)
+        return logits
 
 
 class TiDE_Cls(nn.Module):

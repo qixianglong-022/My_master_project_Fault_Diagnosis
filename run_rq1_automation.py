@@ -27,11 +27,10 @@ GPU_ID = 0
 
 
 def evaluate_source_domain(model, dataloader, device):
-    """源域精度计算 (V2 适配)"""
+    """源域精度计算 (V3 终极修复版)"""
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        # [V2 Change] Unpack 7 items
         for mic, mac, ac, cur, spd, ld, y_cls in dataloader:
             mic, mac = mic.to(device), mac.to(device)
             ac, cur = ac.to(device), cur.to(device)
@@ -41,10 +40,18 @@ def evaluate_source_domain(model, dataloader, device):
             is_phys = hasattr(model, 'pgfa') or model.__class__.__name__.startswith('Phys')
 
             if is_phys:
-                logits, _ = model(mic, mac, ac, cur, spd, ld)
+                # Phys 模型: 全量输入
+                out = model(mic, mac, ac, cur, spd, ld)
             else:
-                full_x = torch.cat([mic.squeeze(-1), mac.squeeze(-1), ac, cur], dim=1)
-                logits, _ = model(full_x, spd)
+                # [关键修复] 基线模型: 保持与 Trainer 一致，只喂 Micro 信号！
+                # 不要拼接 full_x，否则 TiDE 会因为维度不匹配报错
+                out = model(mic, spd)
+
+            # 智能解包
+            if isinstance(out, tuple):
+                logits = out[0]
+            else:
+                logits = out
 
             correct += (torch.argmax(logits, dim=1) == y_cls).sum().item()
             total += y_cls.size(0)

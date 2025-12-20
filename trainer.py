@@ -22,33 +22,36 @@ class Trainer:
         total = 0
 
         # [NEW] Unpack 7 items
-        # 注意这里解包出来的是 ld_proxy
         for batch_idx, (mic, mac, ac, cur, spd, ld_proxy, label) in enumerate(dataloader):
             mic, mac = mic.to(self.device), mac.to(self.device)
             ac, cur = ac.to(self.device), cur.to(self.device)
-
-            # [Fix] 将 ld 改为 ld_proxy，保持变量名一致
             spd, ld_proxy = spd.to(self.device), ld_proxy.to(self.device)
-
             label = label.to(self.device)
 
             self.optimizer.zero_grad()
 
+            # [修复 1] 预先初始化 pred_load，防止 UnboundLocalError
+            pred_load = None
+
             # Forward (V2 接口)
             if self.config.MODEL_NAME == 'Phys-RDLinear':
-                # 确保传入模型的也是移动到 device 后的 ld_proxy
+                # Phys 模型: 接收所有物理参数
                 logits, pred_load = self.model(mic, mac, ac, cur, spd, ld_proxy)
             else:
-                # 兼容基线 (需自行适配基线模型的 forward)
-                logits = self.model(mic) # 或者是 ac
+                # [修复 2] 基线模型通用调用：传入 speed (TiDE 必选，其他可选但传入无害)
+                out = self.model(mic, speed=spd)
+
+                # [修复 3] 智能解包：如果返回 (logits, aux)，只取 logits
+                if isinstance(out, tuple):
+                    logits = out[0]
+                else:
+                    logits = out
 
             # Loss (仅分类)
             loss = self.criterion(logits, label)
 
             # 只有当模型真的输出了 pred_load (即 MTL 模式开启) 时才计算回归损失
-            # 在新的设计中，pred_load 始终为 None，所以这里只计算分类 Loss
             if pred_load is not None:
-                # 如果未来想做自监督，这里 ld_proxy 也可以作为 target
                 loss_reg = nn.MSELoss()(pred_load, ld_proxy)
                 loss += 0.5 * loss_reg
 
@@ -64,6 +67,7 @@ class Trainer:
             "loss": total_loss / len(dataloader),
             "acc": 100.0 * correct / total
         }
+
 
     @torch.no_grad()
     def evaluate(self, dataloader, save_path: str = None) -> float:
