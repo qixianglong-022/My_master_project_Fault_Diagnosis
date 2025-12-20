@@ -13,7 +13,7 @@ class Ch4DualStreamDataset(Dataset):
         self.cls_map = {'HH': 0, 'RU': 1, 'RM': 2, 'SW': 3, 'VU': 4, 'BR': 5, 'KA': 6, 'FB': 7}
 
         # 容器
-        self.micro, self.macro, self.acoustic = [], [], []
+        self.micro, self.macro, self.acoustic, self.current = [], [], [], []
         self.speed, self.labels, self.loads = [], [], []
 
         # 1. 加载数据
@@ -47,14 +47,19 @@ class Ch4DualStreamDataset(Dataset):
                 d = np.load(os.path.join(self.config.DATA_DIR, f), allow_pickle=True).item()
                 if len(d['micro']) == 0: continue
 
-                self.micro.append(d['micro'])  # [N, 512]
-                self.macro.append(d['panorama'])  # [N, 512]
-                self.acoustic.append(d['acoustic'])  # [N, 26]
-                self.speed.append(d['speed'])  # [N] (Hz)
+                self.micro.append(d['micro'])
+                self.macro.append(d['macro'])
+                self.acoustic.append(d['acoustic'])
+                self.current.append(d['current'])  # [NEW]
+                self.speed.append(d['speed'])
+                self.loads.append(d['load_rms'])  # [NEW] 使用计算出的 RMS Load
 
                 N = len(d['micro'])
-                self.labels.append(np.full(N, self.cls_map.get(domain, 0)))
-                self.loads.append(np.full(N, d['load']))
+                label_str = d.get('label_domain', parts[0])  # 兼容
+                self.labels.append(np.full(N, self.cls_map.get(label_str, 0)))
+
+        # Concatenate ...
+        self.current = np.concatenate(self.current).astype(np.float32)
 
         if len(self.micro) > 0:
             self.micro = np.concatenate(self.micro).astype(np.float32)
@@ -75,7 +80,11 @@ class Ch4DualStreamDataset(Dataset):
                 'macro_mean': np.mean(self.macro, axis=0),
                 'macro_std': np.std(self.macro, axis=0) + 1e-6,
                 'ac_mean': np.mean(self.acoustic, axis=0),
-                'ac_std': np.std(self.acoustic, axis=0) + 1e-6
+                'ac_std': np.std(self.acoustic, axis=0) + 1e-6,
+
+                'curr_mean': np.mean(self.current, axis=0),
+                'curr_std': np.std(self.current, axis=0) + 1e-6,
+                'load_max': np.max(self.loads) + 1e-6  # 负载归一化到 0-1
             }
             with open(self.scaler_path, 'wb') as f:
                 pickle.dump(scaler, f)
@@ -91,6 +100,10 @@ class Ch4DualStreamDataset(Dataset):
         self.micro = (self.micro - scaler['micro_mean']) / scaler['micro_std']
         self.macro = (self.macro - scaler['macro_mean']) / scaler['macro_std']
         self.acoustic = (self.acoustic - scaler['ac_mean']) / scaler['ac_std']
+        self.current = (self.current - scaler['curr_mean']) / scaler['curr_std']  # [NEW]
+
+        # 负载归一化 (MinMax)
+        self.loads = self.loads / scaler['load_max']  # [NEW]
 
     def __getitem__(self, idx):
         # 1. 频谱特征 [512, 1] - 增加通道维
@@ -103,6 +116,9 @@ class Ch4DualStreamDataset(Dataset):
         # 3. 物理转速 (Hz) - 保持 Scalar，供 PGFA 使用
         spd = torch.tensor([self.speed[idx]], dtype=torch.float32)
 
+        # [NEW] 电流特征
+        cur = torch.from_numpy(self.current[idx])  # [128]
+
         # 4. 负载标签 (Regression Target) - 归一化到 0-1
         # 假设最大负载 400kg
         ld = torch.tensor([self.loads[idx] / 400.0], dtype=torch.float32)
@@ -110,7 +126,7 @@ class Ch4DualStreamDataset(Dataset):
         # 5. 分类标签
         lb = torch.tensor(self.labels[idx], dtype=torch.long)
 
-        return mic, mac, ac, spd, lb, ld
+        return mic, mac, ac, cur, spd, ld, lb
 
     def __len__(self):
         return len(self.labels)

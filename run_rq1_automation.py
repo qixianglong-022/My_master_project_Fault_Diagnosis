@@ -27,21 +27,28 @@ GPU_ID = 0
 
 
 def evaluate_source_domain(model, dataloader, device):
-    """源域精度计算 (Simple)"""
+    """源域精度计算 (V2 适配)"""
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        for micro, macro, ac, spd, y_cls, _ in dataloader:
-            micro, macro, ac, spd = micro.to(device), macro.to(device), ac.to(device), spd.to(device)
+        # [V2 Change] Unpack 7 items
+        for mic, mac, ac, cur, spd, ld, y_cls in dataloader:
+            mic, mac = mic.to(device), mac.to(device)
+            ac, cur = ac.to(device), cur.to(device)
+            spd, ld = spd.to(device), ld.to(device)
             y_cls = y_cls.to(device)
 
-            if hasattr(model, 'pgfa'):
-                logits, _ = model(micro, macro, ac, spd)
+            is_phys = hasattr(model, 'pgfa') or model.__class__.__name__.startswith('Phys')
+
+            if is_phys:
+                logits, _ = model(mic, mac, ac, cur, spd, ld)
             else:
-                full_x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
+                full_x = torch.cat([mic.squeeze(-1), mac.squeeze(-1), ac, cur], dim=1)
                 logits, _ = model(full_x, spd)
+
             correct += (torch.argmax(logits, dim=1) == y_cls).sum().item()
             total += y_cls.size(0)
+
     return (correct / total) * 100 if total > 0 else 0.0
 
 

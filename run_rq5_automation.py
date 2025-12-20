@@ -31,38 +31,60 @@ GPU_ID = 0
 
 
 def evaluate_with_noise(model, dataloader, device, snr):
-    """带噪声注入的评估函数"""
+    """带噪声注入的评估函数 (V2 适配版)"""
     model.eval()
     all_preds, all_labels = [], []
 
     with torch.no_grad():
-        for micro, macro, ac, spd, y_cls, y_load in dataloader:
-            micro, macro, ac, spd = micro.to(device), macro.to(device), ac.to(device), spd.to(device)
+        # [V2 Change] Unpack 7 items
+        # 注意变量名：DataLoader 吐出的是 mic, mac...
+        for mic, mac, ac, cur, spd, ld, y_cls in dataloader:
+            mic, mac = mic.to(device), mac.to(device)
+            ac, cur = ac.to(device), cur.to(device)
+            spd, ld = spd.to(device), ld.to(device)
+            y_cls = y_cls.to(device)
 
             # --- 1. 筛选 0kg (轻载) 样本 ---
-            load_real = (y_load * 400).round().int()
-            mask_0kg = (load_real == 0).squeeze()
+            # 还原真实负载: ld 是归一化的 (x/400)，反算
+            load_real = (ld * 400).round().int()
+            # 筛选条件：< 100kg 视为轻载 (兼容 0kg)
+            mask_0kg = (load_real < 100).squeeze()
 
             if mask_0kg.sum() == 0: continue
 
-            micro = micro[mask_0kg]
-            macro = macro[mask_0kg]
+            # 应用筛选掩码
+            mic = mic[mask_0kg]
+            mac = mac[mask_0kg]
             ac = ac[mask_0kg]
+            cur = cur[mask_0kg]
             spd = spd[mask_0kg]
+            ld = ld[mask_0kg]
             y_cls = y_cls[mask_0kg]
 
             # --- 2. 注入噪声 ---
             if snr is not None:
-                micro = add_gaussian_noise(micro, snr)
-                macro = add_gaussian_noise(macro, snr)
+                mic = add_gaussian_noise(mic, snr)
+                mac = add_gaussian_noise(mac, snr)
                 ac = add_gaussian_noise(ac, snr)
+                # cur = add_gaussian_noise(cur, snr) # 电流通常不加噪，如需可取消注释
 
             # --- 3. 推理 ---
-            is_phys = hasattr(model, 'pgfa') or model.__class__.__name__.startswith('Phys')
+            # [Fix] 在这里定义 is_phys
+            is_phys = hasattr(model, 'pgfa') or \
+                      model.__class__.__name__.startswith('Phys') or \
+                      model.__class__.__name__.startswith('Ablation')
+
             if is_phys:
-                logits, _ = model(micro, macro, ac, spd)
+                # V2 Phys Model: 6 参数
+                logits, _ = model(mic, mac, ac, cur, spd, ld)
             else:
-                full_x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
+                # Baseline: Concat Feature + Speed
+                full_x = torch.cat([
+                    mic.squeeze(-1),
+                    mac.squeeze(-1),
+                    ac,
+                    cur
+                ], dim=1)
                 logits, _ = model(full_x, spd)
 
             preds = torch.argmax(logits, dim=1)

@@ -113,43 +113,56 @@ class Config:
 # ================= Chapter 4 Dedicated Config (第四章专用配置) =================
 @dataclass
 class Ch4Config:
-    """第四章：变工况域泛化实验专用配置"""
-
+    """
+    [Chapter 4 Dedicated Config]
+    第四章专用配置：包含电流通道、新特征维度、新采样率等。
+    """
     # --- 1. 基础路径 ---
     PROJECT_ROOT: str = Config.PROJECT_ROOT
-    DATA_DIR: str = os.path.join(PROJECT_ROOT, "processed_data_ch4_dual_stream")
-    CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints_ch4")
+    # 为了物理隔离，建议数据目录也区分开
+    DATA_DIR: str = os.path.join(PROJECT_ROOT, "processed_data_ch4_v2")
+    CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints_ch4_v2")
 
-    # --- 2. 物理参数 (CRITICAL FIX) ---
-    # 论文 P1: "降采样50倍...分辨率提升至1Hz"
-    # 原始 51200 / 50 = 1024 Hz
-    # 奈奎斯特频率 = 512 Hz -> FFT点数 1024 -> 单边谱 512点
-    FREQ_DIM: int = 512
+    # --- 2. 物理通道定义 (Ch4 独有) ---
+    # [NEW] 电流通道索引 (假设第6列)
+    COL_INDICES_CURRENT: List[int] = field(default_factory=lambda: [6])
+
+    # 引用 Config 中的定义，但允许在这里覆盖
+    COL_INDEX_SPEED: int = Config.COL_INDEX_SPEED
+    COL_INDICES_VIB: List[int] = field(default_factory=lambda: Config.COL_INDICES_VIB)
+    COL_INDICES_AUDIO: List[int] = field(default_factory=lambda: Config.COL_INDICES_AUDIO)
+
+    # --- 3. 物理特征参数 ---
+    SAMPLE_RATE: int = 1024  # 降采样后的有效采样率
+    FREQ_DIM: int = 512  # 振动频谱 (1024点FFT/2)
+    CURRENT_DIM: int = 128  # [NEW] 电流频谱维度 (低频关注)
+    AUDIO_DIM: int = 15  # MFCC(13) + SF(1) + ER(1)
+
     NUM_CLASSES: int = 8
-    SAMPLE_RATE: int = 1024  # [修正] 必须是 1024，否则 PGFA 频率轴对不上
 
-    # --- 3. 模型超参 ---
+    # --- 4. 模型超参 ---
     HIDDEN_DIM: int = 128
-    PGFA_SIGMA: float = 2.0  # 稍微调小一点，让物理掩膜更尖锐
+    PGFA_SIGMA: float = 2.0
 
-    # --- 4. 训练参数 ---
+    # [NEW] 类别权重 (HH, RU, RM, SW, VU, BR, KA, FB)
+    CLASS_WEIGHTS: List[float] = field(default_factory=lambda: [2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+
+    # --- 5. 训练参数 ---
     BATCH_SIZE: int = 16
-    EPOCHS: int = 60         # 小样本收敛快，60足够
-    LEARNING_RATE: float = 2e-3 # 稍微加大初始LR
+    EPOCHS: int = 60
+    LEARNING_RATE: float = 2e-3
     SEED: int = 42
 
-    # --- 5. 实验协议 (单源域泛化) ---
-    # Train: 200kg (Source)
+    # --- 6. 实验工况 ---
     TRAIN_LOADS: List[int] = field(default_factory=lambda: [200])
     TRAIN_SPEEDS: List[str] = field(default_factory=lambda: ['15', '45', '15-45', '45-15'])
-
-    # Test: 0kg & 400kg (Target)
     TEST_LOADS: List[int] = field(default_factory=lambda: [0, 400])
     TEST_SPEEDS: List[str] = field(default_factory=lambda: [
         '15', '30', '45', '60',
         '15-45', '30-60', '45-15', '60-30'
     ])
 
+    # 速度ID映射表 (保持不变)
     SPEED_ID_MAP = {
         '1': '15', '2': '30', '3': '45', '4': '60',
         '5': '15-45', '6': '30-60', '7': '45-15', '8': '60-30'
@@ -157,3 +170,4 @@ class Ch4Config:
 
     def __post_init__(self):
         os.makedirs(self.CHECKPOINT_DIR, exist_ok=True)
+        os.makedirs(self.DATA_DIR, exist_ok=True)

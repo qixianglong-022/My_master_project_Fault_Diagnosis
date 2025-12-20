@@ -1,22 +1,19 @@
 import torch
-import numpy as np
-import os
-from torch.utils.data import DataLoader
+import torch.nn as nn
 from config import Ch4Config
-from utils.uncertainty_loss import UncertaintyLoss
+import os
 
 class Trainer:
     def __init__(self, config: Ch4Config, model, device: torch.device):
         self.config = config
         self.model = model
         self.device = device
-        self.criterion = UncertaintyLoss().to(device)
 
-        # 优化器设置
-        self.optimizer = torch.optim.Adam([
-            {'params': model.parameters()},
-            {'params': self.criterion.parameters(), 'lr': 1e-3}
-        ], lr=config.LEARNING_RATE)
+        # [NEW] 类别加权 CE Loss
+        class_weights = torch.tensor(config.CLASS_WEIGHTS).to(device)
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
 
     def train_epoch(self, dataloader):
         self.model.train()
@@ -24,47 +21,40 @@ class Trainer:
         correct = 0
         total = 0
 
-        for batch_idx, (micro, macro, ac, spd, y_cls, y_load) in enumerate(dataloader):
-            micro, macro = micro.to(self.device), macro.to(self.device)
-            ac, spd = ac.to(self.device), spd.to(self.device)
-            y_cls, y_load = y_cls.to(self.device), y_load.to(self.device)
+        # [NEW] Unpack 7 items
+        for batch_idx, (mic, mac, ac, cur, spd, ld, label) in enumerate(dataloader):
+            mic, mac = mic.to(self.device), mac.to(self.device)
+            ac, cur = ac.to(self.device), cur.to(self.device)
+            spd, ld = spd.to(self.device), ld.to(self.device)
+            label = label.to(self.device)
 
             self.optimizer.zero_grad()
 
-            # Forward
-            if self.config.MODEL_NAME.startswith('Phys') or self.config.MODEL_NAME.startswith('Ablation'):
-                logits, pred_load = self.model(micro, macro, ac, spd)
+            # Forward (V2 接口)
+            if self.config.MODEL_NAME == 'Phys-RDLinear':
+                logits, _ = self.model(mic, mac, ac, cur, spd, ld)
             else:
-                # Baselines: Concat inputs (Micro + Macro)
-                # 确保基线模型也能处理 spd 输入 (我们在 models/baselines_ch4.py 中已经做了兼容)
-                full_x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
-                logits, pred_load = self.model(full_x, spd)
+                # 兼容基线 (需自行适配基线模型的 forward)
+                pass
 
-            # Loss Calculation
-            if pred_load is not None:
-                # MTL (Phys-RDLinear 或 Ablation-MTL)
-                loss, l_cls, l_reg = self.criterion(logits, y_cls, pred_load, y_load)
-            else:
-                # Single Task (Baseline)
-                loss = torch.nn.functional.cross_entropy(logits, y_cls)
+            # Loss (仅分类)
+            loss = self.criterion(logits, label)
 
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
 
-            # 计算准确率 (修复 KeyError: 'acc')
             preds = torch.argmax(logits, dim=1)
-            correct += (preds == y_cls).sum().item()
-            total += y_cls.size(0)
+            correct += (preds == label).sum().item()
+            total += label.size(0)
 
-        # 返回字典，包含 loss 和 acc
         return {
             "loss": total_loss / len(dataloader),
             "acc": 100.0 * correct / total
         }
 
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader, save_path: str = None) -> float:
+    def evaluate(self, dataloader, save_path: str = None) -> float:
         self.model.eval()
         correct, total = 0, 0
         results = []

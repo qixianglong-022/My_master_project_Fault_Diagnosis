@@ -34,72 +34,47 @@ def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None
 
 
 def compute_mmd(model, src_loader, tgt_loader, device):
-    """
-    计算源域和目标域特征空间的 MMD 距离
-    """
     model.eval()
-
-    # 定义 Hook 获取倒数第二层特征 (Fusion Layer)
     features = []
 
+    # Hook 位置：V2 模型的 cls_head 还是存在的
     def hook_fn(module, input, output):
-        # input[0] 是进入分类头之前的 fusion 特征
-        features.append(input[0])
+        features.append(input[0])  # input to cls_head is the fused feature
 
-    # 注册 Hook 到 cls_head (假设它是最后一层)
-    # Phys-RDLinear 结构: model.cls_head = nn.Sequential(...)
-    # 我们Hook cls_head 的第一层
     handle = model.cls_head.register_forward_hook(hook_fn)
-
-    # 提取特征 (采样一部分，避免 OOM)
     max_samples = 300
     src_feats, tgt_feats = [], []
 
-    with torch.no_grad():
-        # Source Loop
-        for micro, macro, ac, spd, _, _ in src_loader:
-            micro, macro, ac, spd = micro.to(device), macro.to(device), ac.to(device), spd.to(device)
+    def get_feats(loader):
+        collected = []
+        with torch.no_grad():
+            # [V2 Change] Unpack 7 items
+            for mic, mac, ac, cur, spd, ld, _ in loader:
+                mic, mac = mic.to(device), mac.to(device)
+                ac, cur = ac.to(device), cur.to(device)
+                spd, ld = spd.to(device), ld.to(device)
 
-            # === [关键修复] ===
-            # 不再只检查 pgfa 属性，而是检查类名。
-            # 只要是 PhysRDLinearCls (无论是否消融)，都必须传 4 个参数
-            is_phys = model.__class__.__name__.startswith('Phys')
+                is_phys = model.__class__.__name__.startswith('Phys')
+                if is_phys:
+                    _ = model(mic, mac, ac, cur, spd, ld)
+                else:
+                    full_x = torch.cat([mic.squeeze(-1), mac.squeeze(-1), ac, cur], dim=1)
+                    _ = model(full_x, spd)
 
-            if is_phys:
-                _ = model(micro, macro, ac, spd)  # 触发 Hook
-            else:
-                # 兼容 RQ1 的基线模型
-                x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
-                _ = model(x, spd)
+                collected.append(features[-1])
+                features.clear()
+                if len(collected) * mic.size(0) >= max_samples: break
+        return collected
 
-            src_feats.append(features[-1])  # 取最近一次 Hook 的结果
-            features.clear()  # 清空
-            if len(src_feats) * micro.size(0) >= max_samples: break
+    # Run
+    src_chunks = get_feats(src_loader)
+    tgt_chunks = get_feats(tgt_loader)
+    handle.remove()
 
-        # Target Loop
-        for micro, macro, ac, spd, _, _ in tgt_loader:
-            micro, macro, ac, spd = micro.to(device), macro.to(device), ac.to(device), spd.to(device)
+    if not src_chunks or not tgt_chunks: return 1.0
 
-            # 同样的判断逻辑
-            is_phys = model.__class__.__name__.startswith('Phys')
-
-            if is_phys:
-                _ = model(micro, macro, ac, spd)
-            else:
-                x = torch.cat([micro.squeeze(-1), macro.squeeze(-1)], dim=1)
-                _ = model(x, spd)
-
-            tgt_feats.append(features[-1])
-            features.clear()
-            if len(tgt_feats) * micro.size(0) >= max_samples: break
-
-    handle.remove()  # 移除 Hook
-
-    # 拼接
-    if len(src_feats) == 0 or len(tgt_feats) == 0: return 1.0  # Error
-
-    S = torch.cat(src_feats, dim=0)[:max_samples]
-    T = torch.cat(tgt_feats, dim=0)[:max_samples]
+    S = torch.cat(src_chunks, dim=0)[:max_samples]
+    T = torch.cat(tgt_chunks, dim=0)[:max_samples]
 
     # 计算 MMD
     loss = 0

@@ -112,19 +112,24 @@ def read_raw_data_robust(file_path):
 
 class CH4DualStreamProcessor:
     def __init__(self):
-        self.original_fs = Config.SAMPLE_RATE  # 51200
-        self.decimation = 50
-        self.target_fs = self.original_fs / self.decimation  # 1024 Hz
-        self.fft_points = 1024
+        # 初始化 Ch4 配置实例
+        self.ch4_cfg = Ch4Config()
 
+        self.original_fs = Config.SAMPLE_RATE  # 51200 (这是硬件属性，共用 Config 没问题)
+        self.decimation = 50
+        self.target_fs = self.original_fs / self.decimation
+
+        self.fft_points = 1024
         self.hanning = np.hanning(self.fft_points)
         self.correction = 1.63
 
-        self.win_size_raw = self.fft_points * self.decimation  # 51200
-        self.stride = self.win_size_raw  # 无重叠
+        self.win_size_raw = self.fft_points * self.decimation
+        self.stride = self.win_size_raw
 
-        self.extractor = FeatureExtractor(Config)
-        self.out_dir = Ch4Config.DATA_DIR
+        self.extractor = FeatureExtractor(Config)  # 特征提取器依赖基础 Config
+
+        # 输出目录指向 Ch4Config 定义的新路径
+        self.out_dir = self.ch4_cfg.DATA_DIR
         os.makedirs(self.out_dir, exist_ok=True)
 
         # 理论转速表 (用于兜底)
@@ -176,14 +181,19 @@ class CH4DualStreamProcessor:
                 continue
 
             # 3. 通道获取
-            # 增加越界保护
             max_col = raw.shape[1]
-            if Config.COL_INDICES_VIB[0] >= max_col or Config.COL_INDEX_SPEED >= max_col:
-                print(f"[Skip] 数据列不足: {fname} (Cols={max_col})")
-                continue
 
-            vib = raw[:, Config.COL_INDICES_VIB[0]]
+            curr_idx = self.ch4_cfg.COL_INDICES_CURRENT[0]
+
+            # 获取各通道数据
+            vib = raw[:, Config.COL_INDICES_VIB[0]]  # 振动仍用 Config
             spd_signal = raw[:, Config.COL_INDEX_SPEED]
+
+            # 获取电流 (带越界保护)
+            if curr_idx < max_col:
+                curr = raw[:, curr_idx]
+            else:
+                curr = np.zeros_like(vib)
 
             # 声纹通道保护
             aud_idx = Config.COL_INDICES_AUDIO[0]
@@ -192,7 +202,7 @@ class CH4DualStreamProcessor:
             else:
                 aud = np.zeros_like(vib)
 
-            samples = {'micro': [], 'macro': [], 'acoustic': [], 'speed': []}
+            samples = {'micro': [], 'macro': [], 'acoustic': [], 'current': [], 'speed': [], 'load_rms': []}
 
             N = len(vib)
             # 理论转速兜底
@@ -202,6 +212,7 @@ class CH4DualStreamProcessor:
                 seg_vib = vib[i: i + self.win_size_raw]
                 seg_spd = spd_signal[i: i + self.win_size_raw]
                 seg_aud = aud[i: i + self.win_size_raw]
+                seg_curr = curr[i: i + self.win_size_raw]
 
                 # A. 计算物理转速
                 hz = robust_compute_frequency_hz(seg_spd, self.original_fs, default_hz)
@@ -215,6 +226,14 @@ class CH4DualStreamProcessor:
                     # 极少数情况 decimate 可能会因为数据太短报错
                     continue
 
+                # [NEW] Current 处理
+                # 1. 频谱特征 (用于分类)
+                fft_curr_full = self._compute_fft(seg_curr[:self.fft_points])
+                fft_curr = fft_curr_full[:self.ch4_cfg.CURRENT_DIM]  # 使用 Ch4Config 定义的维度 (128)
+
+                # 2. 负载 RMS (用于物理引导)
+                curr_rms = np.sqrt(np.mean(seg_curr ** 2))
+
                 # C. Macro Stream (直接 FFT)
                 fft_macro = self._compute_fft(seg_vib[:self.fft_points])
 
@@ -224,16 +243,19 @@ class CH4DualStreamProcessor:
                 samples['micro'].append(fft_micro)
                 samples['macro'].append(fft_macro)
                 samples['acoustic'].append(mfcc)
+                samples['current'].append(fft_curr)  # [NEW]
                 samples['speed'].append(hz)
+                samples['load_rms'].append(curr_rms)  # [NEW] RMS Load
 
             if len(samples['micro']) > 0:
                 data = {
                     'micro': np.array(samples['micro'], dtype=np.float32),
-                    'macro': np.array(samples['macro'], dtype=np.float32),  # 统一键名
-                    'panorama': np.array(samples['macro'], dtype=np.float32),  # 兼容旧代码键名
+                    'macro': np.array(samples['macro'], dtype=np.float32),
                     'acoustic': np.array(samples['acoustic'], dtype=np.float32),
+                    'current': np.array(samples['current'], dtype=np.float32),  # [NEW]
                     'speed': np.array(samples['speed'], dtype=np.float32),
-                    'load': float(load_id) * 100 if load_id != '0' else 0.0
+                    'load_rms': np.array(samples['load_rms'], dtype=np.float32),  # [NEW]
+                    'label_domain': dom  # 保存标签字符串
                 }
                 np.save(save_path, data)
 

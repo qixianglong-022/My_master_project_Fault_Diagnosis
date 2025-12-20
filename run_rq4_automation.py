@@ -14,59 +14,47 @@ from trainer import Trainer
 from utils.tools import set_seed
 from utils.rq4_kit import plot_rq4_modal_comparison
 
-# === 实验配置 ===
 EXPERIMENTS = {
-    'Vib_Only': {
-        'desc': '仅振动 (Mask Audio)',
-        'mask_vib': False, 'mask_audio': True
-    },
-    'Audio_Only': {
-        'desc': '仅声纹 (Mask Vibration)',
-        'mask_vib': True, 'mask_audio': False
-    },
-    'Fusion': {
-        'desc': '多模态融合 (Full)',
-        'mask_vib': False, 'mask_audio': False
-    }
+    'Vib_Only': {'desc': '仅振动', 'mask_vib': False, 'mask_audio': True, 'mask_curr': True},
+    'Audio_Only': {'desc': '仅声纹', 'mask_vib': True, 'mask_audio': False, 'mask_curr': True},
+    'Curr_Only': {'desc': '仅电流', 'mask_vib': True, 'mask_audio': True, 'mask_curr': False},  # [NEW]
+    'Fusion': {'desc': '三模态融合', 'mask_vib': False, 'mask_audio': False, 'mask_curr': False}
 }
-GPU_ID = 0
 
 
 class MaskedTrainer(Trainer):
-    """RQ4 专用掩码训练器"""
-
     def __init__(self, config, model, device, mask_cfg):
         super().__init__(config, model, device)
         self.mask_cfg = mask_cfg
 
-    def _apply_mask(self, micro, macro, ac):
-        if self.mask_cfg['mask_vib']:
-            micro = torch.zeros_like(micro)
-            macro = torch.zeros_like(macro)
-        if self.mask_cfg['mask_audio']:
+    def _apply_mask(self, mic, mac, ac, cur):
+        if self.mask_cfg.get('mask_vib', False):
+            mic = torch.zeros_like(mic)
+            mac = torch.zeros_like(mac)
+        if self.mask_cfg.get('mask_audio', False):
             ac = torch.zeros_like(ac)
-        return micro, macro, ac
+        if self.mask_cfg.get('mask_curr', False):  # [NEW]
+            cur = torch.zeros_like(cur)
+        return mic, mac, ac, cur
 
     def train_epoch(self, dataloader):
         self.model.train()
         total_loss = 0
-        for micro, macro, ac, spd, y_cls, y_load in dataloader:
-            micro, macro, ac, spd = micro.to(self.device), macro.to(self.device), ac.to(self.device), spd.to(
-                self.device)
-            y_cls, y_load = y_cls.to(self.device), y_load.to(self.device).float().unsqueeze(1)
+        # [V2 Change] Unpack 7
+        for mic, mac, ac, cur, spd, ld, label in dataloader:
+            mic, mac = mic.to(self.device), mac.to(self.device)
+            ac, cur = ac.to(self.device), cur.to(self.device)
+            spd, ld = spd.to(self.device), ld.to(self.device)
+            label = label.to(self.device)
 
-            # Mask
-            micro, macro, ac = self._apply_mask(micro, macro, ac)
+            # Masking
+            mic, mac, ac, cur = self._apply_mask(mic, mac, ac, cur)
 
             self.optimizer.zero_grad()
-            logits, pred_load = self.model(micro, macro, ac, spd)
+            # Forward V2
+            logits, _ = self.model(mic, mac, ac, cur, spd, ld)
 
-            # Loss (使用 F 接口避免 AttributeError)
-            loss_cls = F.cross_entropy(logits, y_cls)
-            loss = loss_cls
-            if pred_load is not None:
-                loss += 0.5 * F.mse_loss(pred_load, y_load)
-
+            loss = self.criterion(logits, label)  # V2 trainer uses weighted CE
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
