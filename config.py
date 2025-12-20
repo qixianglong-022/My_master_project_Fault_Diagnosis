@@ -124,7 +124,7 @@ class Ch4Config:
     CHECKPOINT_DIR: str = os.path.join(PROJECT_ROOT, "checkpoints_ch4_v2")
 
     # --- 2. 物理通道定义 (Ch4 独有) ---
-    # [NEW] 电流通道索引 (假设第6列)
+    # [NEW] 电流W通道索引 (第6列)
     COL_INDICES_CURRENT: List[int] = field(default_factory=lambda: [6])
 
     # 引用 Config 中的定义，但允许在这里覆盖
@@ -154,6 +154,10 @@ class Ch4Config:
     SEED: int = 42
 
     # --- 6. 实验工况 ---
+    # [物理引导策略变更]
+    # 我们不再使用 400.0 这种硬编码的物理最大值
+    # 而是让 DataLoader 自动统计训练集的 Max Current RMS
+    # 这里的 TRAIN_LOADS 仅用于筛选数据集文件，不参与归一化计算
     TRAIN_LOADS: List[int] = field(default_factory=lambda: [200])
     TRAIN_SPEEDS: List[str] = field(default_factory=lambda: ['15', '45', '15-45', '45-15'])
     TEST_LOADS: List[int] = field(default_factory=lambda: [0, 400])

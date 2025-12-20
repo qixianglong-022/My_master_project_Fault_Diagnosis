@@ -22,23 +22,35 @@ class Trainer:
         total = 0
 
         # [NEW] Unpack 7 items
-        for batch_idx, (mic, mac, ac, cur, spd, ld, label) in enumerate(dataloader):
+        # 注意这里解包出来的是 ld_proxy
+        for batch_idx, (mic, mac, ac, cur, spd, ld_proxy, label) in enumerate(dataloader):
             mic, mac = mic.to(self.device), mac.to(self.device)
             ac, cur = ac.to(self.device), cur.to(self.device)
-            spd, ld = spd.to(self.device), ld.to(self.device)
+
+            # [Fix] 将 ld 改为 ld_proxy，保持变量名一致
+            spd, ld_proxy = spd.to(self.device), ld_proxy.to(self.device)
+
             label = label.to(self.device)
 
             self.optimizer.zero_grad()
 
             # Forward (V2 接口)
             if self.config.MODEL_NAME == 'Phys-RDLinear':
-                logits, _ = self.model(mic, mac, ac, cur, spd, ld)
+                # 确保传入模型的也是移动到 device 后的 ld_proxy
+                logits, pred_load = self.model(mic, mac, ac, cur, spd, ld_proxy)
             else:
                 # 兼容基线 (需自行适配基线模型的 forward)
-                pass
+                logits = self.model(mic) # 或者是 ac
 
             # Loss (仅分类)
             loss = self.criterion(logits, label)
+
+            # 只有当模型真的输出了 pred_load (即 MTL 模式开启) 时才计算回归损失
+            # 在新的设计中，pred_load 始终为 None，所以这里只计算分类 Loss
+            if pred_load is not None:
+                # 如果未来想做自监督，这里 ld_proxy 也可以作为 target
+                loss_reg = nn.MSELoss()(pred_load, ld_proxy)
+                loss += 0.5 * loss_reg
 
             loss.backward()
             self.optimizer.step()
