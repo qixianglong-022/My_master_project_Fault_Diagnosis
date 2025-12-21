@@ -20,7 +20,7 @@ def get_model(model_name: str, config: Ch4Config):
 
     # 1. 我们的主角 (Ours) - 内部会自己处理 Micro/Macro，不受这里影响
     if model_name == 'Phys-RDLinear':
-        return PhysRDLinearCls(config, enable_pgfa=True, enable_mtl=True)
+        return PhysRDLinearCls(config, enable_pgfa=True, enable_mtl=False)
 
     # 2. 消融实验配置
     elif model_name == 'Ablation-Base':
