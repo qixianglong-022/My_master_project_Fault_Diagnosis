@@ -1,89 +1,71 @@
-# utils/rq4_kit.py
-import os
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import os
+import numpy as np
 from utils.visualization import set_style
 
-# === 全局中文与样式 ===
 FONT_PROP = set_style()
 
 
-def plot_rq4_modal_comparison(csv_path, save_dir):
+def plot_covariate_analysis(csv_path, save_dir):
     """
-    生成 RQ4 多模态消融对比图 (柱状图)
+    绘制协变量重要性分析图
+    1. 准确率对比 (Bar)
+    2. MMD 距离对比 (Line)
     """
-    if not os.path.exists(csv_path):
-        print(f"[Warn] CSV not found: {csv_path}")
-        return
+    if not os.path.exists(csv_path): return
 
     df = pd.read_csv(csv_path)
+    # 排序: No -> Speed -> Load -> Full (逻辑顺序)
+    # 或者 No -> Load -> Speed -> Full (按性能)
+    order = ['No_Covariates', 'Load_Only', 'Speed_Only', 'Full_Covariates']
+    df = df.set_index('Config').reindex(order).reset_index()
 
-    # 转换数据格式用于绘图 (Melt)
-    # 我们关注 0kg (最难工况) 和 400kg (正常工况)
-    plot_data = []
+    labels = ['无协变量', '仅负载', '仅转速', '完整模型']
 
-    # 定义显示名称
-    name_map = {
-        'Vib_Only': '仅振动 (Vibration)',
-        'Audio_Only': '仅声纹 (Acoustic)',
-        'Fusion': '多模态融合 (Fusion)'
-    }
+    fig, ax1 = plt.subplots(figsize=(10, 6))
 
-    for idx, row in df.iterrows():
-        cfg = row['Config']
-        if cfg not in name_map: continue
+    # 1. 准确率柱状图
+    x = np.arange(len(df))
+    width = 0.4
+    bars = ax1.bar(x, df['Avg_Acc'], width, color='#5f9e6e', alpha=0.85, label='平均准确率 (%)')
 
-        display_name = name_map[cfg]
-
-        # 添加 0kg 数据
-        plot_data.append({
-            'Configuration': display_name,
-            'Condition': '轻载 (0kg)',
-            'Accuracy': row['Acc_0kg']
-        })
-        # 添加 400kg 数据
-        plot_data.append({
-            'Configuration': display_name,
-            'Condition': '重载 (400kg)',
-            'Accuracy': row['Acc_400kg']
-        })
-
-    plot_df = pd.DataFrame(plot_data)
-
-    # === 绘图 ===
-    plt.figure(figsize=(10, 6))
-
-    # 颜色策略: 蓝色(Vib), 绿色(Audio), 红色(Fusion)
-    palette = {
-        '仅振动 (Vibration)': '#1f77b4',
-        '仅声纹 (Acoustic)': '#2ca02c',
-        '多模态融合 (Fusion)': '#d62728'
-    }
-
-    sns.barplot(
-        data=plot_df,
-        x='Condition',
-        y='Accuracy',
-        hue='Configuration',
-        palette=palette,
-        edgecolor='black',
-        linewidth=0.8
-    )
-
-    # 样式微调
-    plt.ylim(0, 105)
-    plt.ylabel('诊断准确率 (%)', fontsize=14, fontproperties=FONT_PROP)
-    plt.xlabel('工况负载', fontsize=14, fontproperties=FONT_PROP)
-    plt.title('多模态融合消融实验对比 (RQ4)', fontsize=16, fontproperties=FONT_PROP, pad=20)
-    plt.legend(title='模态配置', prop=FONT_PROP, title_fontproperties=FONT_PROP, loc='lower right')
-    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    ax1.set_ylabel('准确率 (%)', fontproperties=FONT_PROP, fontsize=14, color='#333333')
+    ax1.set_ylim(0, 100)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels, fontproperties=FONT_PROP, fontsize=12)
 
     # 标数值
-    for container in plt.gca().containers:
-        plt.gca().bar_label(container, fmt='%.1f', padding=3, fontsize=10)
+    for bar in bars:
+        h = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width() / 2, h + 1.5, f"{h:.1f}",
+                 ha='center', va='bottom', fontsize=11, fontweight='bold')
 
-    # 保存
-    save_path = os.path.join(save_dir, 'RQ4_Modal_Comparison.pdf')
-    plt.savefig(save_path, bbox_inches='tight', dpi=300)
-    print(f"    -> 图表已生成: {os.path.basename(save_path)}")
+    # 计算贡献度 (相对于 No_Covariates)
+    base_acc = df.loc[0, 'Avg_Acc']
+    for i in range(1, len(df)):
+        diff = df.loc[i, 'Avg_Acc'] - base_acc
+        sign = '+' if diff >= 0 else ''
+        # 在柱子中间写提升幅度
+        ax1.text(x[i], df.loc[i, 'Avg_Acc'] / 2, f"{sign}{diff:.1f}%",
+                 ha='center', va='center', color='white', fontweight='bold', fontsize=10)
+
+    # 2. MMD 折线图 (右轴)
+    ax2 = ax1.twinx()
+    ax2.plot(x, df['MMD'], color='#d65f5f', marker='D', markersize=8, linewidth=2, linestyle='--', label='MMD 距离')
+    ax2.set_ylabel('域间 MMD 距离', fontproperties=FONT_PROP, fontsize=14, color='#d65f5f')
+    ax2.tick_params(axis='y', labelcolor='#d65f5f')
+
+    # 图例
+    lines, lbls = ax1.get_legend_handles_labels()
+    lines2, lbls2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines + lines2, lbls + lbls2, loc='upper left', prop=FONT_PROP)
+
+    plt.title("物理协变量对泛化性能与特征分布的影响", fontproperties=FONT_PROP, fontsize=16, pad=15)
+    plt.tight_layout()
+
+    save_path = os.path.join(save_dir, "RQ4_Covariate_Impact.pdf")
+    plt.savefig(save_path, dpi=300)
+    print(f"    [Plot] Saved chart to {save_path}")
+    plt.close()

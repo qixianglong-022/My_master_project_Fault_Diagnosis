@@ -1,195 +1,258 @@
-# run_rq4_advanced.py
 import os
 import torch
 import torch.nn.functional as F
 import pandas as pd
-import numpy as np
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, f1_score
 
 from config import Ch4Config
 from data_loader_ch4 import Ch4DualStreamDataset
 from models.factory import get_model
 from trainer import Trainer
 from utils.tools import set_seed
-from utils.rq4_kit import plot_rq4_modal_comparison
+from utils.rq1_kit import evaluate_rq1_comprehensive
+from utils.rq3_kit import compute_mmd  # 复用 MMD 计算
+from utils.rq4_kit import plot_covariate_analysis
 
-EXPERIMENTS = {
-    'Vib_Only': {'desc': '仅振动', 'mask_vib': False, 'mask_audio': True, 'mask_curr': True},
-    'Audio_Only': {'desc': '仅声纹', 'mask_vib': True, 'mask_audio': False, 'mask_curr': True},
-    'Curr_Only': {'desc': '仅电流', 'mask_vib': True, 'mask_audio': True, 'mask_curr': False},  # [NEW]
-    'Fusion': {'desc': '三模态融合', 'mask_vib': False, 'mask_audio': False, 'mask_curr': False}
+# ==============================================================================
+# 1. 实验配置: 协变量消融
+# ==============================================================================
+# 控制变量：是否使用 转速(Speed) 和 负载(Load)
+# False = 置零 (Mask), True = 正常输入
+experiments = {
+    'No_Covariates': {
+        'use_speed': False,
+        'use_load': False,
+        'desc': '无协变量 (Baseline)'
+    },
+    'Speed_Only': {
+        'use_speed': True,
+        'use_load': False,
+        'desc': '仅转速 (Speed)'
+    },
+    'Load_Only': {
+        'use_speed': False,
+        'use_load': True,
+        'desc': '仅负载 (Load)'
+    },
+    'Full_Covariates': {
+        'use_speed': True,
+        'use_load': True,
+        'desc': '双协变量 (Full)'
+    }
 }
+GPU_ID = 0
 
 
-class MaskedTrainer(Trainer):
-    def __init__(self, config, model, device, mask_cfg):
+# ==============================================================================
+# 2. 协变量专用训练器
+# ==============================================================================
+class CovariateTrainer(Trainer):
+    """
+    RQ4 专用训练器
+    功能：在训练过程中对 Speed 或 Load 进行 Mask (置零)
+    """
+
+    def __init__(self, config, model, device, cov_cfg):
         super().__init__(config, model, device)
-        self.mask_cfg = mask_cfg
+        self.cov_cfg = cov_cfg
 
-    def _apply_mask(self, mic, mac, ac, cur):
-        if self.mask_cfg.get('mask_vib', False):
-            mic = torch.zeros_like(mic)
-            mac = torch.zeros_like(mac)
-        if self.mask_cfg.get('mask_audio', False):
-            ac = torch.zeros_like(ac)
-        if self.mask_cfg.get('mask_curr', False):  # [NEW]
-            cur = torch.zeros_like(cur)
-        return mic, mac, ac, cur
+    def _apply_covariate_mask(self, spd, ld):
+        """
+        核心掩码逻辑
+        """
+        # 如果配置为不使用，则将其置为 0 (模拟缺失或未感知)
+        if not self.cov_cfg['use_speed']:
+            spd = torch.zeros_like(spd)
+
+        if not self.cov_cfg['use_load']:
+            ld = torch.zeros_like(ld)
+
+        return spd, ld
 
     def train_epoch(self, dataloader):
         self.model.train()
         total_loss = 0
-        # [V2 Change] Unpack 7
-        for mic, mac, ac, cur, spd, ld, label in dataloader:
-            mic, mac = mic.to(self.device), mac.to(self.device)
-            ac, cur = ac.to(self.device), cur.to(self.device)
-            spd, ld = spd.to(self.device), ld.to(self.device)
-            label = label.to(self.device)
 
-            # Masking
-            mic, mac, ac, cur = self._apply_mask(mic, mac, ac, cur)
+        # [适配] 解包 8 个变量
+        for micro, macro, ac, cur, spd, y_load, y_cls, _ in dataloader:
+
+            # 1. 数据迁移
+            micro = micro.to(self.device)
+            macro = macro.to(self.device)
+            ac = ac.to(self.device)
+            cur = cur.to(self.device)
+            spd = spd.to(self.device)
+            y_cls = y_cls.to(self.device)
+            y_load = y_load.to(self.device).float()
+
+            # 2. 应用协变量掩码 (Ablation)
+            spd, y_load_input = self._apply_covariate_mask(spd, y_load.clone())
+
+            # 注意: y_load 用于回归 Loss 时不需要 mask (它是标签)
+            # 但作为 input 输入给模型时需要 mask (y_load_input)
 
             self.optimizer.zero_grad()
-            # Forward V2
-            logits, _ = self.model(mic, mac, ac, cur, spd, ld)
 
-            loss = self.criterion(logits, label)  # V2 trainer uses weighted CE
+            # 3. 前向传播 (6 参数)
+            logits, pred_load = self.model(micro, macro, ac, cur, spd, y_load_input)
+
+            # 4. 计算损失
+            loss_cls = F.cross_entropy(logits, y_cls)
+            loss = loss_cls
+
+            # 只有当 'use_load' 为 True 时，MTL 回归才有意义
+            # 如果 Mask 了负载输入，通常也意味着无法进行负载回归(或者是盲猜)，这里为了公平，
+            # 只有在 Full 或 Load_Only 模式下才计算回归 Loss
+            if self.cov_cfg['use_load'] and pred_load is not None:
+                loss_reg = F.mse_loss(pred_load, y_load)  # y_load 是真实标签
+                loss = 0.5 * loss_cls + 0.5 * loss_reg
+
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
+
         return {'loss': total_loss / len(dataloader)}
 
 
-def evaluate_rq4_local(model, dataloader, device, mask_cfg):
+# ==============================================================================
+# 3. 带掩码的评估函数
+# ==============================================================================
+def evaluate_covariates(model, dataloader, device, save_dir, cfg_name, cov_cfg):
     """
-    RQ4 专用评估逻辑
-    关键：如果是 Audio_Only，必须禁用 PEG (物理能量门控)，否则所有样本会被判为健康
+    通过 Hook 方式 Mask 协变量进行评估
     """
-    model.eval()
-    all_preds, all_labels, all_loads = [], [], []
+    print(f"    [Eval] Evaluating {cfg_name}...")
 
-    # 智能 PEG 开关
-    # 只有当振动信号存在 (mask_vib=False) 时，PEG 才有意义
-    ENABLE_PEG = not mask_cfg['mask_vib']
-    PEG_THRESHOLD = 0.05
+    original_forward = model.forward
 
-    with torch.no_grad():
-        for micro, macro, ac, spd, y_cls, y_load in dataloader:
-            micro, macro, ac, spd = micro.to(device), macro.to(device), ac.to(device), spd.to(device)
+    # 定义临时 Forward
+    def masked_forward(micro, macro, acoustic, cur, speed, load_proxy):
+        # 掩码逻辑
+        if not cov_cfg['use_speed']:
+            speed = torch.zeros_like(speed)
+        if not cov_cfg['use_load']:
+            load_proxy = torch.zeros_like(load_proxy)
 
-            # Mask
-            if mask_cfg['mask_vib']:
-                micro = torch.zeros_like(micro)
-                macro = torch.zeros_like(macro)
-            if mask_cfg['mask_audio']:
-                ac = torch.zeros_like(ac)
+        return original_forward(micro, macro, acoustic, cur, speed, load_proxy)
 
-            # Inference
-            # 强制 4 参数调用
-            logits, _ = model(micro, macro, ac, spd)
-            preds = torch.argmax(logits, dim=1)
+    model.forward = masked_forward
 
-            # PEG (仅在振动模式下启用)
-            if ENABLE_PEG:
-                input_rms = torch.sqrt(torch.mean(micro.squeeze(-1) ** 2, dim=1))
-                is_noise = input_rms < PEG_THRESHOLD
-                preds[is_noise] = 0
-
-            all_preds.append(preds.cpu().numpy())
-            all_labels.append(y_cls.cpu().numpy())
-            all_loads.append(y_load.cpu().numpy())
-
-    # 汇总指标
-    y_pred = np.concatenate(all_preds)
-    y_true = np.concatenate(all_labels)
-    loads_real = (np.concatenate(all_loads).flatten() * 400).round().astype(int)
-
-    metrics = {}
-    metrics['Avg_Acc'] = accuracy_score(y_true, y_pred) * 100
-    metrics['Avg_F1'] = f1_score(y_true, y_pred, average='macro') * 100
-
-    # 分负载计算
-    for ld in [0, 400]:
-        mask = (loads_real == ld)
-        if np.sum(mask) > 0:
-            acc = accuracy_score(y_true[mask], y_pred[mask]) * 100
-            metrics[f'Acc_{ld}kg'] = acc
-        else:
-            metrics[f'Acc_{ld}kg'] = 0.0
+    try:
+        # 复用 RQ1 评估
+        metrics = evaluate_rq1_comprehensive(model, dataloader, device, save_dir, cfg_name)
+    finally:
+        model.forward = original_forward
 
     return metrics
 
 
+def compute_mmd_covariates(model, src_dl, tgt_dl, device, cov_cfg):
+    """
+    带掩码的 MMD 计算
+    """
+    original_forward = model.forward
+
+    def masked_forward(micro, macro, acoustic, cur, speed, load_proxy):
+        if not cov_cfg['use_speed']:
+            speed = torch.zeros_like(speed)
+        if not cov_cfg['use_load']:
+            load_proxy = torch.zeros_like(load_proxy)
+        return original_forward(micro, macro, acoustic, cur, speed, load_proxy)
+
+    model.forward = masked_forward
+    try:
+        val = compute_mmd(model, src_dl, tgt_dl, device)
+    finally:
+        model.forward = original_forward
+    return val
+
+
+# ==============================================================================
+# 4. 主流程
+# ==============================================================================
 def main():
     print("=========================================================")
-    print("   RQ4 Automation: Multi-Modal Ablation Study")
+    print("   RQ4 Automation: Covariate Importance Analysis")
     print("=========================================================")
 
     rq4_root = os.path.join("checkpoints_ch4", "rq4")
     os.makedirs(rq4_root, exist_ok=True)
 
     config = Ch4Config()
-    config.MODEL_NAME = 'Phys-RDLinear'  # RQ4 固定模型
+    config.MODEL_NAME = 'Phys-RDLinear'  # 始终使用完整模型架构
     set_seed(config.SEED)
     device = torch.device(f'cuda:{GPU_ID}' if torch.cuda.is_available() else 'cpu')
 
+    # 数据准备
     train_dl = DataLoader(Ch4DualStreamDataset(config, mode='train'),
                           batch_size=config.BATCH_SIZE, shuffle=True)
     test_dl = DataLoader(Ch4DualStreamDataset(config, mode='test'),
                          batch_size=config.BATCH_SIZE, shuffle=False)
 
+    # MMD Loader
+    mmd_src = DataLoader(Ch4DualStreamDataset(config, mode='train'), batch_size=32, shuffle=True)
+    mmd_tgt = DataLoader(Ch4DualStreamDataset(config, mode='test'), batch_size=32, shuffle=True)
+
     results = []
 
-    for cfg_name, mask_settings in EXPERIMENTS.items():
-        print(f"\n>>> [Task] Running: {cfg_name} ({mask_settings['desc']})")
+    for cfg_name, cov_cfg in experiments.items():
+        print(f"\n>>> [Task] Running: {cfg_name}")
 
         save_dir = os.path.join(rq4_root, cfg_name)
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1. 初始化
+        # 1. 初始化模型
         model = get_model('Phys-RDLinear', config).to(device)
 
-        # 2. 训练
-        trainer = MaskedTrainer(config, model, device, mask_settings)
+        # 2. 训练 (带 Covariate Mask)
+        trainer = CovariateTrainer(config, model, device, cov_cfg)
         ckpt_path = os.path.join(save_dir, "model.pth")
 
         if os.path.exists(ckpt_path):
             print("    [Info] Loading checkpoint...")
-            # 增加 weights_only=False 避免警告 (或按需处理)
-            model.load_state_dict(torch.load(ckpt_path))
-        else:
-            print("    [Info] Training...")
-            epochs = 30
+            try:
+                model.load_state_dict(torch.load(ckpt_path, map_location=device))
+            except:
+                os.remove(ckpt_path)
+
+        if not os.path.exists(ckpt_path):
+            print("    [Info] Training with covariates masked...")
+            epochs = 25
             for epoch in range(epochs):
                 trainer.train_epoch(train_dl)
             torch.save(model.state_dict(), ckpt_path)
 
-        # 3. 评估
-        print("    [Eval] Evaluating...")
-        metrics = evaluate_rq4_local(model, test_dl, device, mask_settings)
+        # 3. 评估准确率
+        row = evaluate_covariates(model, test_dl, device, save_dir, cfg_name, cov_cfg)
 
-        row = {
-            'Config': cfg_name,
-            'Description': mask_settings['desc'],
-            'Avg_Acc': metrics['Avg_Acc'],
-            'Acc_0kg': metrics['Acc_0kg'],
-            'Acc_400kg': metrics['Acc_400kg']
-        }
+        # 4. 计算 MMD
+        print("    [Eval] Calculating MMD...")
+        mmd_val = compute_mmd_covariates(model, mmd_src, mmd_tgt, device, cov_cfg)
+
+        row['Config'] = cfg_name
+        row['Description'] = cov_cfg['desc']
+        row['MMD'] = mmd_val
+        row['Speed'] = cov_cfg['use_speed']
+        row['Load'] = cov_cfg['use_load']
+
         results.append(row)
-        print(f"    -> Avg Acc: {row['Avg_Acc']:.2f}% (0kg: {row['Acc_0kg']:.1f}%)")
+        print(f"    -> Acc: {row['Avg_Acc']:.2f}%, MMD: {mmd_val:.4f}")
 
-    # 4. 汇总与绘图
+    # 5. 汇总
     if results:
         df = pd.DataFrame(results)
-        csv_path = os.path.join(rq4_root, "RQ4_Modal_Analysis.csv")
-        df.to_csv(csv_path, index=False)
-        print(f"\n>>> 汇总表已保存: {csv_path}")
+        csv_path = os.path.join(rq4_root, "RQ4_Covariate_Analysis.csv")
+        # 整理列顺序
+        cols = ['Config', 'Description', 'Avg_Acc', 'MMD', 'Acc_0kg', 'Acc_400kg']
+        rest = [c for c in df.columns if c not in cols]
+        df[cols + rest].to_csv(csv_path, index=False)
+        print(f"\n>>> Saved: {csv_path}")
 
-        plot_rq4_modal_comparison(csv_path, rq4_root)
+        # 绘图
+        plot_covariate_analysis(csv_path, rq4_root)
 
     print("\n=========================================================")
-    print("   RQ4 Completed! See checkpoints/rq4/")
+    print("   RQ4 Completed!")
     print("=========================================================")
 
 

@@ -1,7 +1,6 @@
-# run_rq2_advanced.py
 import os
 import torch
-import torch.nn.functional as F  # <--- [新增] 引入函数式接口
+import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import DataLoader
 
@@ -10,84 +9,116 @@ from data_loader_ch4 import Ch4DualStreamDataset
 from models.factory import get_model
 from trainer import Trainer
 from utils.tools import set_seed
-from utils.rq1_kit import evaluate_rq1_comprehensive  # 复用 RQ1 的评估逻辑
-from utils.rq2_kit import plot_rq2_bar_chart  # RQ2 专用绘图
+from utils.rq1_kit import evaluate_rq1_comprehensive
+from utils.rq2_kit import plot_rq2_bar_chart
 
-# === 实验配置 ===
-# 定义三种对比实验配置
-EXPERIMENTS = {
+# ==============================================================================
+# 1. 实验配置 (Ablation Study Settings)
+# ==============================================================================
+# 定义消融实验配置：控制哪些模态参与训练/推理
+# True = 保留, False = 置零 (Mask)
+experiments = {
     'Micro_Only': {
-        'desc': '仅低频 (1kHz)',
-        'mask_macro': True,  # 屏蔽高频
-        'mask_micro': False,
-        'mask_audio': True  # 屏蔽声纹
+        'micro': True,
+        'macro': False,
+        'audio': False,
+        'current': False
     },
-    'Macro_Only': {
-        'desc': '仅高频 (51.2kHz)',
-        'mask_macro': False,
-        'mask_micro': True,  # 屏蔽低频
-        'mask_audio': True
+    'Audio_Only': {
+        'micro': False,
+        'macro': False,
+        'audio': True,
+        'current': False
     },
-    'Multi_Res': {
-        'desc': '多分辨率融合 (Ours)',
-        'mask_macro': False,
-        'mask_micro': False,
-        'mask_audio': True  # 全开
+    'Current_Only': {  # 新增：纯电流模态
+        'micro': False,
+        'macro': False,
+        'audio': False,
+        'current': True
+    },
+    'Vib_Plus_Audio': {  # 振动 + 声纹 (无电流)
+        'micro': True,
+        'macro': True,
+        'audio': True,
+        'current': False
+    },
+    'Phys-RDLinear': {  # 全模态 (完整模型)
+        'micro': True,
+        'macro': True,
+        'audio': True,
+        'current': True
     }
 }
 GPU_ID = 0
 
 
+# ==============================================================================
+# 2. Masked Trainer (带掩码的训练器)
+# ==============================================================================
 class MaskedTrainer(Trainer):
     """
     继承 Trainer，增加数据掩码功能
-    在训练和测试时将特定通道置零
+    在训练时将特定通道置零，实现模态消融
     """
 
-    def __init__(self, config, model, device, mask_cfg):
+    def __init__(self, config, model, device, mask_cfg, exp_name):
         super().__init__(config, model, device)
         self.mask_cfg = mask_cfg
+        self.exp_name = exp_name  # 用于逻辑判断
 
-    def _apply_mask(self, micro, macro, ac):
-        """核心掩码逻辑"""
-        # 注意：这里我们使用 clone() 避免修改原始数据，虽然在循环里通常不需要
-        # 但为了安全起见，直接覆盖变量即可
-        if self.mask_cfg['mask_micro']:
+    def _apply_mask(self, micro, macro, ac, cur):
+        """
+        核心掩码逻辑：根据配置将 Tensor 置零
+        """
+        # 注意：使用 key.get(name, True) 默认为 True (不遮蔽)
+        if not self.mask_cfg.get('micro', True):
             micro = torch.zeros_like(micro)
-        if self.mask_cfg['mask_macro']:
+
+        if not self.mask_cfg.get('macro', True):
             macro = torch.zeros_like(macro)
-        if self.mask_cfg['mask_audio']:
+
+        if not self.mask_cfg.get('audio', True):
             ac = torch.zeros_like(ac)
-        return micro, macro, ac
+
+        if not self.mask_cfg.get('current', True):
+            cur = torch.zeros_like(cur)
+
+        return micro, macro, ac, cur
 
     def train_epoch(self, dataloader):
         self.model.train()
         total_loss = 0
 
-        for micro, macro, ac, spd, y_cls, y_load in dataloader:
+        # [修复] 解包 8 个变量 (适配最新 DataLoader)
+        for micro, macro, ac, cur, spd, y_load, y_cls, _ in dataloader:
+
+            # 1. 数据迁移
             micro = micro.to(self.device)
             macro = macro.to(self.device)
             ac = ac.to(self.device)
+            cur = cur.to(self.device)
             spd = spd.to(self.device)
             y_cls = y_cls.to(self.device)
-            y_load = y_load.to(self.device).float().unsqueeze(1)
 
-            # === Apply Mask (应用掩码) ===
-            micro, macro, ac = self._apply_mask(micro, macro, ac)
+            # [修复] y_load 已经是 [B, 1]，不需要 unsqueeze
+            y_load = y_load.to(self.device).float()
+
+            # 2. 应用掩码 (消融实验核心)
+            # 必须同时处理 cur，防止信息泄露
+            micro, macro, ac, cur = self._apply_mask(micro, macro, ac, cur)
 
             self.optimizer.zero_grad()
-            logits, pred_load = self.model(micro, macro, ac, spd)
 
-            # === Loss Calculation (修复点: 使用 F 接口) ===
-            # 不再依赖 self.criterion_cls，直接调用 PyTorch 标准函数
+            # 3. 模型前向传播 (传入所有 6 个参数)
+            logits, pred_load = self.model(micro, macro, ac, cur, spd, y_load)
+
+            # 4. 计算损失
             loss_cls = F.cross_entropy(logits, y_cls)
-
-            loss = loss_cls  # 基础损失
+            loss = loss_cls
 
             if pred_load is not None:
                 loss_reg = F.mse_loss(pred_load, y_load)
-                # 使用固定权重 1:1，确保消融实验的公平性
-                # (自适应 Loss 在某些通道被 Mask 时可能会不稳定)
+                # 固定权重，保证公平对比
                 loss = 0.5 * loss_cls + 0.5 * loss_reg
 
             loss.backward()
@@ -97,44 +128,66 @@ class MaskedTrainer(Trainer):
         return {'loss': total_loss / len(dataloader)}
 
 
-def evaluate_masked(model, dataloader, device, save_dir, cfg_name, mask_cfg):
+# ==============================================================================
+# 3. Masked Evaluation (带掩码的评估)
+# ==============================================================================
+def evaluate_masked(model, dataloader, device, save_dir, cfg_name, mask_settings):
     """
-    带掩码的评估函数: 使用 Hook 机制临时修改 forward
+    带掩码的评估函数 (通过 Hook 替换 forward 实现)
     """
-    # 保存原始 forward
+    print(f"    [Eval] Evaluating {cfg_name} on Target Domain...")
+
+    # 1. 保存原始 forward
     original_forward = model.forward
 
-    # 定义带掩码的 forward
-    def masked_forward(micro, macro, ac, spd):
-        if mask_cfg['mask_micro']: micro = torch.zeros_like(micro)
-        if mask_cfg['mask_macro']: macro = torch.zeros_like(macro)
-        if mask_cfg['mask_audio']: ac = torch.zeros_like(ac)
-        return original_forward(micro, macro, ac, spd)
+    # 2. 定义带 Mask 的临时 forward (必须接收 6 个参数!)
+    def masked_forward(micro, macro, acoustic, cur, speed, load_proxy):
+        # 显式遮蔽逻辑
+        if not mask_settings.get('micro', True):
+            micro = torch.zeros_like(micro)
 
-    # 临时替换
+        if not mask_settings.get('macro', True):
+            macro = torch.zeros_like(macro)
+
+        if not mask_settings.get('audio', True):
+            acoustic = torch.zeros_like(acoustic)
+
+        if not mask_settings.get('current', True):
+            cur = torch.zeros_like(cur)
+
+        # 调用原始 forward
+        return original_forward(micro, macro, acoustic, cur, speed, load_proxy)
+
+    # 3. 临时替换 forward
     model.forward = masked_forward
 
     try:
-        # 调用标准评估 (它会调用被我们替换过的 forward)
-        print(f"    [Eval] Evaluating {cfg_name} on Target Domain...")
+        # 4. 调用通用评估流程 (复用 RQ1 代码)
         metrics = evaluate_rq1_comprehensive(model, dataloader, device, save_dir, cfg_name)
+    except Exception as e:
+        print(f"    [Error] Evaluation failed for {cfg_name}: {e}")
+        model.forward = original_forward
+        raise e
     finally:
-        # 务必还原 forward，防止污染后续实验
+        # 5. 务必恢复原始 forward
         model.forward = original_forward
 
     return metrics
 
 
+# ==============================================================================
+# 4. 主流程
+# ==============================================================================
 def main():
     print("=========================================================")
-    print("   RQ2 Automation: Resolution Ablation Study")
+    print("   RQ2 Automation: Multi-modal Ablation Study")
     print("=========================================================")
 
     rq2_root = os.path.join("checkpoints_ch4", "rq2")
     os.makedirs(rq2_root, exist_ok=True)
 
     config = Ch4Config()
-    config.MODEL_NAME = 'Phys-RDLinear'  # RQ2 始终使用该模型
+    config.MODEL_NAME = 'Phys-RDLinear'  # RQ2 始终基于该模型进行消融
     set_seed(config.SEED)
     device = torch.device(f'cuda:{GPU_ID}' if torch.cuda.is_available() else 'cpu')
 
@@ -146,8 +199,8 @@ def main():
 
     final_results = []
 
-    for cfg_name, mask_settings in EXPERIMENTS.items():
-        print(f"\n>>> [Task] Running Experiment: {cfg_name} ({mask_settings['desc']})")
+    for cfg_name, mask_settings in experiments.items():
+        print(f"\n>>> [Task] Running Experiment: {cfg_name}")
 
         save_dir = os.path.join(rq2_root, cfg_name)
         os.makedirs(save_dir, exist_ok=True)
@@ -156,16 +209,24 @@ def main():
         model = get_model('Phys-RDLinear', config).to(device)
 
         # 2. 训练 (带 Mask)
-        trainer = MaskedTrainer(config, model, device, mask_settings)
+        # 传入 exp_name 以便 Trainer 内部做额外判断(如果需要)
+        trainer = MaskedTrainer(config, model, device, mask_settings, cfg_name)
 
         ckpt_path = os.path.join(save_dir, "model.pth")
+
+        # 检查点逻辑：如果存在且完整则跳过训练
         if os.path.exists(ckpt_path):
             print("    [Info] Loading existing checkpoint...")
-            model.load_state_dict(torch.load(ckpt_path))
-        else:
+            # weights_only=False 是为了兼容旧版 PyTorch 习惯，虽然有安全警告但本地运行无妨
+            try:
+                model.load_state_dict(torch.load(ckpt_path, map_location=device))
+            except:
+                print("    [Warn] Checkpoint load failed, retraining...")
+                os.remove(ckpt_path)
+
+        if not os.path.exists(ckpt_path):
             print("    [Info] Training with mask...")
-            # 消融实验通常收敛较快，跑 30 个 Epoch 足够
-            epochs = 30
+            epochs = 30  # 消融实验快速验证
             for epoch in range(epochs):
                 metrics = trainer.train_epoch(train_dl)
                 if (epoch + 1) % 10 == 0:
@@ -174,28 +235,36 @@ def main():
 
         # 3. 评估 (带 Mask)
         row = evaluate_masked(model, test_dl, device, save_dir, cfg_name, mask_settings)
+
+        # 记录结果
         row['Config'] = cfg_name
-        row['Description'] = mask_settings['desc']
+        # 使用配置名作为描述，不再依赖 desc 字段
+        row['Description'] = cfg_name.replace('_', ' ')
         final_results.append(row)
 
-        print(f"    -> Avg Acc: {row['Avg_Acc']:.2f}%")
+        print(f"    -> Avg Acc: {row.get('Avg_Acc', 0):.2f}%")
 
     # 4. 汇总与绘图
     if final_results:
         df = pd.DataFrame(final_results)
-        # 整理列
+
+        # 确保关键列存在
         cols = ['Config', 'Description', 'Avg_Acc', 'Acc_0kg', 'Acc_400kg']
-        rest = [c for c in df.columns if c not in cols]
-        df[cols + rest].to_csv(os.path.join(rq2_root, "RQ2_Resolution_Analysis.csv"), index=False)
+        existing_cols = [c for c in cols if c in df.columns]
+        rest_cols = [c for c in df.columns if c not in cols]
+
+        csv_path = os.path.join(rq2_root, "RQ2_Ablation_Analysis.csv")
+        df[existing_cols + rest_cols].to_csv(csv_path, index=False)
+        print(f"\n    [Save] Results saved to {csv_path}")
 
         print("\n>>> [Plot] Generating Comparison Charts...")
-        plot_rq2_bar_chart(
-            os.path.join(rq2_root, "RQ2_Resolution_Analysis.csv"),
-            rq2_root
-        )
+        try:
+            plot_rq2_bar_chart(csv_path, rq2_root)
+        except Exception as e:
+            print(f"    [Warn] Plotting failed: {e}")
 
     print("\n=========================================================")
-    print("   RQ2 Completed! See checkpoints/rq2/")
+    print("   RQ2 Completed! See checkpoints_ch4/rq2/")
     print("=========================================================")
 
 

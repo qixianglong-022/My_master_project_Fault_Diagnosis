@@ -13,7 +13,8 @@ from utils.tools import set_seed
 from utils.rq1_kit import (
     evaluate_rq1_comprehensive,
     plot_radar_chart_from_csv,
-    plot_tsne_for_model
+    plot_tsne_for_model,
+    plot_fusion_heatmap_automated
 )
 
 MODELS_TO_RUN = [
@@ -27,11 +28,13 @@ GPU_ID = 0
 
 
 def evaluate_source_domain(model, dataloader, device):
-    """源域精度计算 (V3 终极修复版)"""
+    """源域精度计算 (修复版：兼容8返回值)"""
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
-        for mic, mac, ac, cur, spd, ld, y_cls in dataloader:
+        # [修改点] 增加一个 _ 来接收第8个返回值 phys_load，或者使用 *args
+        for mic, mac, ac, cur, spd, ld, y_cls, _ in dataloader:
+
             mic, mac = mic.to(device), mac.to(device)
             ac, cur = ac.to(device), cur.to(device)
             spd, ld = spd.to(device), ld.to(device)
@@ -43,9 +46,8 @@ def evaluate_source_domain(model, dataloader, device):
                 # Phys 模型: 全量输入
                 out = model(mic, mac, ac, cur, spd, ld)
             else:
-                # [关键修复] 基线模型: 保持与 Trainer 一致，只喂 Micro 信号！
-                # 不要拼接 full_x，否则 TiDE 会因为维度不匹配报错
-                out = model(mic, spd)
+                # 基线模型: 只喂 Micro 和 Speed
+                out = model(mic, speed=spd)
 
             # 智能解包
             if isinstance(out, tuple):
@@ -147,6 +149,8 @@ def main():
 
         # 绘图
         plot_tsne_for_model(model, source_eval_dl, test_dl, device, rq1_root, m_name)
+
+    plot_fusion_heatmap_automated()
 
     print("\n=========================================================")
     print("   RQ1 全流程结束！请查看 checkpoints/rq1 文件夹")

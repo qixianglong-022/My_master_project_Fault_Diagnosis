@@ -22,7 +22,8 @@ class Trainer:
         total = 0
 
         # [NEW] Unpack 7 items
-        for batch_idx, (mic, mac, ac, cur, spd, ld_proxy, label) in enumerate(dataloader):
+        # 这里的 phys_load 在训练时用不到，直接忽略即可
+        for batch_idx, (mic, mac, ac, cur, spd, ld_proxy, label, _) in enumerate(dataloader):
             mic, mac = mic.to(self.device), mac.to(self.device)
             ac, cur = ac.to(self.device), cur.to(self.device)
             spd, ld_proxy = spd.to(self.device), ld_proxy.to(self.device)

@@ -1,19 +1,22 @@
-# utils/rq3_kit.py
-import os
 import torch
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import os
 from utils.visualization import set_style
 
-# === 全局设置 ===
 FONT_PROP = set_style()
 
 
-# === 1. MMD (最大均值差异) 计算内核 ===
+# ==============================================================================
+# 1. MMD 计算逻辑 (核心)
+# ==============================================================================
+
 def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
-    """计算高斯核矩阵"""
+    """
+    计算 Gram 核矩阵 (用于 MMD)
+    """
     n_samples = int(source.size()[0]) + int(target.size()[0])
     total = torch.cat([source, target], dim=0)
 
@@ -33,118 +36,147 @@ def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None
     return sum(kernel_val)
 
 
-def compute_mmd(model, src_loader, tgt_loader, device):
+def compute_mmd_loss(source, target):
+    """
+    计算 Maximum Mean Discrepancy (MMD) 损失
+    """
+    batch_size = int(source.size()[0])
+    kernels = guassian_kernel(source, target)
+    XX = kernels[:batch_size, :batch_size]
+    YY = kernels[batch_size:, batch_size:]
+    XY = kernels[:batch_size, batch_size:]
+    YX = kernels[batch_size:, :batch_size]
+    loss = torch.mean(XX + YY - XY - YX)
+    return loss
+
+
+def extract_features_for_mmd(model, dataloader, device, max_batches=10):
+    """
+    从模型中提取特征 (Latent Features) 而不是 Logits
+    """
     model.eval()
     features = []
 
-    # Hook 位置：V2 模型的 cls_head 还是存在的
+    # 1. 定义 Hook 抓取特征
+    # 抓取 cls_head 之前的输入特征 (融合后的特征)
+    hook_data = []
+
     def hook_fn(module, input, output):
-        features.append(input[0])  # input to cls_head is the fused feature
+        # input[0] 通常是进入 Linear 层的特征 Tensor
+        hook_data.append(input[0].detach())
 
-    handle = model.cls_head.register_forward_hook(hook_fn)
-    max_samples = 300
-    src_feats, tgt_feats = [], []
+    # 尝试 Hook 模型的 cls_head (假设是 nn.Sequential 或 Linear)
+    handle = None
+    if hasattr(model, 'cls_head'):
+        # 注册在 cls_head 的第一层
+        handle = model.cls_head.register_forward_hook(hook_fn)
 
-    def get_feats(loader):
-        collected = []
-        with torch.no_grad():
-            # [V2 Change] Unpack 7 items
-            for mic, mac, ac, cur, spd, ld, _ in loader:
-                mic, mac = mic.to(device), mac.to(device)
-                ac, cur = ac.to(device), cur.to(device)
-                spd, ld = spd.to(device), ld.to(device)
+    with torch.no_grad():
+        count = 0
+        # === [核心修改] 解包 8 个变量 (适配最新 DataLoader) ===
+        for micro, macro, ac, cur, spd, ld, y_cls, _ in dataloader:
+            if count >= max_batches: break
 
-                is_phys = model.__class__.__name__.startswith('Phys')
-                if is_phys:
-                    _ = model(mic, mac, ac, cur, spd, ld)
-                else:
-                    full_x = torch.cat([mic.squeeze(-1), mac.squeeze(-1), ac, cur], dim=1)
-                    _ = model(full_x, spd)
+            micro, macro = micro.to(device), macro.to(device)
+            ac, cur = ac.to(device), cur.to(device)
+            spd, ld = spd.to(device), ld.to(device)
 
-                collected.append(features[-1])
-                features.clear()
-                if len(collected) * mic.size(0) >= max_samples: break
-        return collected
+            # Forward (Hook 会自动捕获特征)
+            # === [核心修改] 传入 6 个参数 ===
+            hook_data.clear()  # 清空上一轮
+            _ = model(micro, macro, ac, cur, spd, ld)
 
-    # Run
-    src_chunks = get_feats(src_loader)
-    tgt_chunks = get_feats(tgt_loader)
-    handle.remove()
+            if hook_data:
+                features.append(hook_data[-1])  # 取最后一个 Hook 的结果
 
-    if not src_chunks or not tgt_chunks: return 1.0
+            count += 1
 
-    S = torch.cat(src_chunks, dim=0)[:max_samples]
-    T = torch.cat(tgt_chunks, dim=0)[:max_samples]
+    if handle:
+        handle.remove()
 
-    # 计算 MMD
-    loss = 0
-    kernels = guassian_kernel(S, T)
-    XX = kernels[:len(S), :len(S)]
-    YY = kernels[len(S):, len(S):]
-    XY = kernels[:len(S), len(S):]
-    YX = kernels[len(S):, :len(S)]
-    loss = torch.mean(XX + YY - XY - YX)
-
-    return loss.item()
+    if features:
+        return torch.cat(features, dim=0)
+    else:
+        return None
 
 
-# === 2. 可视化绘图 ===
+def compute_mmd(model, src_loader, tgt_loader, device):
+    """
+    计算源域和目标域特征空间的 MMD 距离
+    """
+    # 提取特征
+    src_feats = extract_features_for_mmd(model, src_loader, device)
+    tgt_feats = extract_features_for_mmd(model, tgt_loader, device)
+
+    if src_feats is None or tgt_feats is None:
+        print("    [Warn] Feature extraction failed for MMD.")
+        return 0.0
+
+    # 对齐数量 (MMD 需要 sample 数一致或接近，这里取最小公倍数或截断)
+    min_len = min(len(src_feats), len(tgt_feats))
+    # 截断到相同长度，且不能太长否则 OOM
+    eval_len = min(min_len, 500)
+
+    src_sample = src_feats[:eval_len]
+    tgt_sample = tgt_feats[:eval_len]
+
+    mmd_val = compute_mmd_loss(src_sample, tgt_sample)
+    return mmd_val.item()
+
+
+# ==============================================================================
+# 2. 绘图功能
+# ==============================================================================
+
 def plot_ablation_chart(csv_path, save_dir):
-    """绘制双轴图: 柱状图(Acc) + 折线图(MMD)"""
-    print(">>> 正在绘制消融实验分析图...")
+    """
+    绘制消融实验结果 (条形图 + 折线图双轴)
+    Bar: 准确率
+    Line: MMD 距离 (越低越好)
+    """
     if not os.path.exists(csv_path): return
-
     df = pd.read_csv(csv_path)
-    # 映射中文名称用于展示
-    name_map = {
-        'Ablation_Base': '基础模型\n(Base)',
-        'Ablation_PGFA': '仅物理引导\n(PGFA)',
-        'Ablation_MTL': '仅负载解耦\n(MTL)',
-        'Phys_RDLinear': '完整方法\n(Ours)'
-    }
-    df['DisplayName'] = df['Config'].map(name_map)
 
-    # 排序
-    order = ['Ablation_Base', 'Ablation_PGFA', 'Ablation_MTL', 'Phys_RDLinear']
-    # 确保 Config 列是 Categorical 类型以便排序
-    df['Config'] = pd.Categorical(df['Config'], categories=order, ordered=True)
-    df = df.sort_values('Config')
+    # 简化名称
+    df['Label'] = df['Config'].apply(lambda x: x.replace('Ablation_', '').replace('Phys_RDLinear', 'Full'))
 
     fig, ax1 = plt.subplots(figsize=(10, 6))
 
-    # 左轴: 准确率 (柱状图)
-    color_bar = '#6baed6'  # 浅蓝
-    bars = ax1.bar(df['DisplayName'], df['Avg_Acc'], color=color_bar, alpha=0.8, width=0.5, label='平均准确率 (%)')
-    ax1.set_ylabel('诊断准确率 (%)', fontsize=13, fontproperties=FONT_PROP, color='#1f77b4')
-    ax1.tick_params(axis='y', labelcolor='#1f77b4')
-    ax1.set_ylim(50, 100)
+    # 1. 柱状图 - 准确率 (左轴)
+    # 使用 0kg 和 400kg 的平均值或者 Avg_Acc
+    x = np.arange(len(df))
+    width = 0.35
 
-    # 标数值
+    bars = ax1.bar(x, df['Avg_Acc'], width, color='#4c72b0', alpha=0.8, label='平均准确率 (%)')
+    ax1.set_ylabel('准确率 (%)', color='#4c72b0', fontproperties=FONT_PROP, fontsize=14)
+    ax1.tick_params(axis='y', labelcolor='#4c72b0')
+    ax1.set_ylim(0, 100)
+
+    # 在柱子上标数值
     for bar in bars:
         height = bar.get_height()
-        ax1.text(bar.get_x() + bar.get_width() / 2., height,
-                 f'{height:.1f}%', ha='center', va='bottom', fontsize=11)
+        ax1.text(bar.get_x() + bar.get_width() / 2., height + 1,
+                 f'{height:.1f}', ha='center', va='bottom', fontsize=11)
 
-    # 右轴: MMD (折线图)
+    # 2. 折线图 - MMD (右轴)
     ax2 = ax1.twinx()
-    color_line = '#d62728'  # 红色
-    line = ax2.plot(df['DisplayName'], df['MMD_Distance'], color=color_line, marker='o',
-                    linewidth=3, markersize=10, linestyle='--', label='MMD 分布距离')
-    ax2.set_ylabel('特征分布距离 (MMD)', fontsize=13, fontproperties=FONT_PROP, color=color_line)
-    ax2.tick_params(axis='y', labelcolor=color_line)
+    ax2.plot(x, df['MMD_Distance'], color='#c44e52', marker='o', linewidth=2, markersize=8, label='特征分布距离 (MMD)')
+    ax2.set_ylabel('MMD 距离 (越低越好)', color='#c44e52', fontproperties=FONT_PROP, fontsize=14)
+    ax2.tick_params(axis='y', labelcolor='#c44e52')
 
-    # 标数值 (MMD)
-    for i, txt in enumerate(df['MMD_Distance']):
-        ax2.text(i, txt + 0.01, f'{txt:.3f}', ha='center', va='bottom', color=color_line, fontsize=11,
-                 fontweight='bold')
+    # 设置 X 轴
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df['Label'], fontproperties=FONT_PROP, fontsize=12, rotation=0)
+    ax1.set_xlabel("消融配置", fontproperties=FONT_PROP, fontsize=14)
 
-    plt.title('物理引导模块消融实验分析 (RQ3)', fontsize=15, fontproperties=FONT_PROP, pad=20)
+    # 标题
+    plt.title("物理引导模块消融实验: 准确率 vs 域偏移距离", fontproperties=FONT_PROP, fontsize=16, pad=20)
 
-    # 合并图例
+    # 图例
     lines, labels = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines + lines2, labels + labels2, loc='upper left', prop=FONT_PROP)
 
-    save_path = os.path.join(save_dir, 'RQ3_Ablation_Analysis.pdf')
-    plt.savefig(save_path, bbox_inches='tight')
-    print(f"    -> 已保存: {os.path.basename(save_path)}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'RQ3_Ablation_MMD.pdf'), dpi=300)
+    plt.close()

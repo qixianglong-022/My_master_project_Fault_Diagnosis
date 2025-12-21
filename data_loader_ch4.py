@@ -147,12 +147,16 @@ class Ch4DualStreamDataset(Dataset):
 
         # 物理引导变量
         spd = torch.tensor([self.speed_hz[idx]], dtype=torch.float32)
-        ld_proxy = torch.tensor([self.current_rms[idx]], dtype=torch.float32)  # Soft Sensor
+        ld_proxy = torch.tensor([self.current_rms[idx]], dtype=torch.float32)
 
+        # 标签
         lb = torch.tensor(self.labels[idx], dtype=torch.long)
 
-        # 返回7个元素
-        return mic, mac, ac, cur_spec, spd, ld_proxy, lb
+        # [新增] 真实的物理负载标签 (仅用于评估分桶)
+        phys_load = torch.tensor(self.phys_load_labels[idx], dtype=torch.float32)
+
+        # 返回 8 个元素 (末尾追加 phys_load)
+        return mic, mac, ac, cur_spec, spd, ld_proxy, lb, phys_load
 
     def __len__(self):
         return len(self.labels)
