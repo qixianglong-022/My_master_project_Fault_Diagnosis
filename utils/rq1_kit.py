@@ -19,7 +19,8 @@ FAULT_MAP_CN = {
     'HH': '健康', 'RU': '转子不平衡', 'RM': '转子不对中', 'SW': '定子绕组',
     'VU': '电压不平衡', 'BR': '转子弯曲', 'KA': '转子断条', 'FB': '轴承故障'
 }
-FAULT_LABELS_SHORT = [FAULT_MAP_CN[c] for c in CLASS_NAMES_EN]
+# FAULT_LABELS_SHORT = [FAULT_MAP_CN[c] for c in CLASS_NAMES_EN] # 使用中文标签
+FAULT_LABELS_SHORT = CLASS_NAMES_EN # 使用字母标签
 COLORS = ['#7f7f7f', '#ff7f0e', '#2ca02c', '#9467bd', '#d62728']
 
 
