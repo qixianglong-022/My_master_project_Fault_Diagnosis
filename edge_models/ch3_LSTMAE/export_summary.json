@@ -1,0 +1,9 @@
+{
+  "model_name": "LSTMAE",
+  "chapter": 3,
+  "checkpoint_path": "checkpoints\\Thesis_Final_Physics_Constraint_AllFault_LSTMAE\\checkpoint.pth",
+  "onnx_path": "edge_models\\ch3_LSTMAE\\model.onnx",
+  "export_timestamp": "2026-01-04T16:11:25.443916",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "pytorch_version": "2.5.0+cu118"
+}

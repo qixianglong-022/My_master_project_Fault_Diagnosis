@@ -1,0 +1,9 @@
+{
+  "model_name": "Transformer",
+  "chapter": 3,
+  "checkpoint_path": "checkpoints\\Thesis_Final_Physics_Constraint_AllFault_Transformer\\checkpoint.pth",
+  "onnx_path": "edge_models\\ch3_Transformer\\model.onnx",
+  "export_timestamp": "2026-01-04T16:04:52.252251",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "pytorch_version": "2.5.0+cu118"
+}

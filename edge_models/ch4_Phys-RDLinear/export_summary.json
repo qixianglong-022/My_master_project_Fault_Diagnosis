@@ -1,0 +1,9 @@
+{
+  "model_name": "Phys-RDLinear",
+  "chapter": 4,
+  "checkpoint_path": "checkpoints_ch4\\rq1\\Phys-RDLinear\\model.pth",
+  "onnx_path": "edge_models\\ch4_Phys-RDLinear\\model.onnx",
+  "export_timestamp": "2026-01-04T16:26:28.657148",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "pytorch_version": "2.5.0+cu118"
+}

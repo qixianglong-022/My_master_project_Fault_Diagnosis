@@ -1,0 +1,9 @@
+{
+  "model_name": "ResNet-18",
+  "chapter": 4,
+  "checkpoint_path": "checkpoints_ch4\\rq1\\ResNet-18\\model.pth",
+  "onnx_path": "edge_models\\ch4_ResNet-18\\model.onnx",
+  "export_timestamp": "2026-01-04T16:26:52.729465",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "pytorch_version": "2.5.0+cu118"
+}

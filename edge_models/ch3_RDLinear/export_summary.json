@@ -1,0 +1,9 @@
+{
+  "model_name": "RDLinear",
+  "chapter": 3,
+  "checkpoint_path": "checkpoints\\Thesis_Final_Physics_Constraint_AllFault_RDLinear\\checkpoint.pth",
+  "onnx_path": "edge_models\\ch3_RDLinear\\model.onnx",
+  "export_timestamp": "2026-01-04T15:53:16.457910",
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "pytorch_version": "2.5.0+cu118"
+}
