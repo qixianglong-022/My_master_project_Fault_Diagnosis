@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 from scipy.signal import decimate
 from collections import deque
+import psutil  # 新增: 用于监控CPU和内存
 
 # 简化配置（不依赖完整Config类）
 SAMPLE_RATE = 51200
@@ -248,12 +249,31 @@ class SentinelPreprocessor:
         # 7. 计算协变量（窗口内的平均）
         if len(speed_down) > 0:
             speed_array = np.array(speed_down)
+
+            # --- [Fix Start] ---
+            # 1. 计算均值 (Feature 1 & 2)
             v_bar = np.mean(speed_array[:, 0])
             v2_bar = np.mean(speed_array[:, 1])
+
+            # 2. 计算斜率 (Feature 3: End - Start)
+            # speed_array[:, 0] 是瞬时转速序列
+            v_start = speed_array[0, 0]
+            v_end = speed_array[-1, 0]
+            v_slope = v_end - v_start
+
             norm_scale = 3000.0
-            cov = np.array([v_bar / norm_scale, v2_bar / (norm_scale ** 2)], dtype=np.float32)
+
+            # 3. 构造 3维 向量 [Mean, Mean_Square, Slope]
+            cov = np.array([
+                v_bar / norm_scale,
+                v2_bar / (norm_scale ** 2),
+                v_slope / norm_scale  # 补上缺失的第3个特征
+            ], dtype=np.float32)
+            # --- [Fix End] ---
+
         else:
-            cov = np.array([0.0, 0.0], dtype=np.float32)
+            # 兜底逻辑也要改成 3 维
+            cov = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         return x_feat, cov
 
@@ -348,6 +368,11 @@ class ExpertPreprocessor:
                 'load_proxy': float 归一化电流RMS
             }
         """
+
+        # 专家模式模型是单通道输入的，如果传入了多通道(N, 4)，只取第1个通道(电机振动)
+        if vib_data.ndim > 1:
+            vib_data = vib_data[:, 0]
+
         # 确保数据长度足够
         if len(vib_data) < self.win_size_raw:
             # 补零
@@ -488,13 +513,28 @@ class SentinelMode:
         self.window_size = RAW_WINDOW_SIZE  # 51200点
         self.hop_size = self.window_size // 10  # 10Hz刷新率
 
+        # 在 SentinelMode 的 __init__ 中添加打印
+        print(f"DEBUG: Input 'cov' shape requirement: {self.session.get_inputs()[1].shape}")
+
+        # [新增] 读取模型元数据 (参数量 & FLOPs)
+        summary_path = self.model_dir / "export_summary.json"
+        if summary_path.exists():
+            with open(summary_path, 'r') as f:
+                info = json.load(f).get('model_info', {})
+                self.params = info.get('params', 'Unknown')
+                self.flops = info.get('flops', 'Unknown')
+                print(f"[Sentinel] Model Info: Params={self.params}, FLOPs={self.flops}")
+        else:
+            self.params = "Unknown"
+            print("[Warn] Sentinel export_summary.json not found.")
+
     def add_data(self, vib: np.ndarray, audio: np.ndarray, speed: np.ndarray):
         """添加数据到缓冲区"""
         self.buffer_vib.extend(vib)
         self.buffer_audio.extend(audio)
         self.buffer_speed.extend(speed)
 
-    def process(self) -> Tuple[float, bool]:
+    def process(self) -> Tuple[float, bool, float]:
         """
         处理缓冲区数据，返回SPE和是否异常
 
@@ -503,7 +543,7 @@ class SentinelMode:
             is_anomaly: 是否异常
         """
         if len(self.buffer_vib) < self.window_size:
-            return 0.0, False
+            return 0.0, False, 0.0
 
         # 取出一个窗口
         vib_window = np.array(self.buffer_vib[:self.window_size])
@@ -517,8 +557,12 @@ class SentinelMode:
             return 0.0, False
 
         # 准备ONNX输入
-        x_input = np.expand_dims(x_feat, axis=0).astype(np.float32)  # [1, Seq_Len, Feat_Dim]
-        cov_input = np.expand_dims(cov, axis=0).astype(np.float32)  # [1, 2]
+        x_input = np.expand_dims(x_feat, axis=0).astype(np.float32)
+        # cov 已经是 [3] 维，expand 后变成 [1, 3]，完全符合模型要求的 ['batch', 3]
+        cov_input = np.expand_dims(cov, axis=0).astype(np.float32)
+
+        # 计时开始
+        t0 = time.perf_counter()
 
         # ONNX推理
         inputs = {
@@ -526,6 +570,9 @@ class SentinelMode:
             self.input_names[1]: cov_input
         }
         pred = self.session.run(None, inputs)[0]
+
+        # 计时结束 (毫秒)
+        latency_ms = (time.perf_counter() - t0) * 1000
 
         # 计算SPE
         diff = (x_input - pred) ** 2
@@ -539,7 +586,7 @@ class SentinelMode:
         self.buffer_audio = self.buffer_audio[self.hop_size:]
         self.buffer_speed = self.buffer_speed[self.hop_size:]
 
-        return spe, is_anomaly
+        return spe, is_anomaly, latency_ms
 
 
 class ExpertMode:
@@ -592,6 +639,17 @@ class ExpertMode:
         self.window_size = 51200  # 1秒数据
         self.hop_size = self.window_size  # 1Hz刷新率
 
+        # 读取模型元数据
+        summary_path = self.model_dir / "export_summary.json"
+        if summary_path.exists():
+            with open(summary_path, 'r') as f:
+                info = json.load(f).get('model_info', {})
+                self.params = info.get('params', 'Unknown')
+                self.flops = info.get('flops', 'Unknown')
+                print(f"[Expert] Model Info: Params={self.params}, FLOPs={self.flops}")
+        else:
+            self.params = "Unknown"
+
     def add_data(self, vib: np.ndarray, audio: np.ndarray, speed: np.ndarray, current: np.ndarray):
         """添加数据到缓冲区"""
         self.buffer_vib.extend(vib)
@@ -599,7 +657,9 @@ class ExpertMode:
         self.buffer_speed.extend(speed)
         self.buffer_current.extend(current)
 
-    def process(self) -> Tuple[int, str, float]:
+    def process(self) -> Tuple[int, str, float, float]:  # 返回值增加 latency
+        if len(self.buffer_vib) < self.window_size:
+            return -1, "Unknown", 0.0, 0.0
         """
         处理缓冲区数据，返回故障类别
 
@@ -630,6 +690,9 @@ class ExpertMode:
         speed = features['speed'].reshape(1, 1).astype(np.float32)
         load_proxy = features['load_proxy'].reshape(1, 1).astype(np.float32)
 
+        # 计时开始
+        t0 = time.perf_counter()
+
         # ONNX推理
         inputs = {
             self.input_names[0]: micro,
@@ -640,6 +703,9 @@ class ExpertMode:
             self.input_names[5]: load_proxy
         }
         logits = self.session.run(None, inputs)[0]
+
+        # 计时结束 (毫秒)
+        latency_ms = (time.perf_counter() - t0) * 1000
 
         # 计算概率和类别
         exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True))
@@ -653,7 +719,7 @@ class ExpertMode:
         self.buffer_speed = self.buffer_speed[self.hop_size:]
         self.buffer_current = self.buffer_current[self.hop_size:]
 
-        return class_id, self.class_names[class_id], confidence
+        return class_id, self.class_names[class_id], confidence, latency_ms
 
 
 class TwoTierDiagnosisSystem:
@@ -695,64 +761,6 @@ class TwoTierDiagnosisSystem:
         print(f"    Expert Mode: 1 Hz")
         print(f"    Cooldown: {self.cooldown_duration}s")
         print(f"{'=' * 60}\n")
-
-    def read_txt_file(self, txt_path: str) -> Optional[np.ndarray]:
-        """
-        读取TXT文件（参考preprocess_atomic.py和preprocess_ch4_manager.py）
-
-        Args:
-            txt_path: TXT文件绝对路径
-
-        Returns:
-            data: [N, M] 数据数组，None表示读取失败
-        """
-        data_start_line = None
-
-        try:
-            # 预扫描：寻找数据起始行
-            with open(txt_path, 'rb') as f:
-                lines = f.readlines()
-                for i, line in enumerate(lines[:50]):
-                    try:
-                        line_str = line.decode('gb18030', errors='ignore')
-                    except:
-                        continue
-                    if 'Time' in line_str and 'Data Channels' in line_str:
-                        data_start_line = i + 1
-                        break
-        except Exception as e:
-            print(f"[Warn] 预扫描文件失败 {txt_path}: {e}")
-            return None
-
-        if data_start_line is None:
-            data_start_line = 17  # 默认值
-
-        # 读取数据
-        try:
-            df = pd.read_csv(
-                txt_path,
-                sep='\t',
-                encoding='gb18030',
-                header=None,
-                skiprows=data_start_line,
-                engine='python'
-            )
-            return df.values
-        except Exception as e:
-            try:
-                # 尝试GBK编码
-                df = pd.read_csv(
-                    txt_path,
-                    sep='\t',
-                    encoding='gbk',
-                    header=None,
-                    skiprows=data_start_line,
-                    engine='python'
-                )
-                return df.values
-            except Exception as e2:
-                print(f"[Error] 读取文件失败 {txt_path}: {e2}")
-                return None
 
     def extract_channels(self, data: np.ndarray) -> Tuple[np.ndarray, ...]:
         """
@@ -805,158 +813,211 @@ class TwoTierDiagnosisSystem:
 
         return vib_data, audio_data, speed_data, current_data
 
+
+    def detect_header_line(self, txt_path: str) -> int:
+        """
+        [New] 仅扫描文件头部以获取数据起始行，不读取整个文件
+        """
+        data_start_line = 17  # 默认值
+        try:
+            with open(txt_path, 'rb') as f:
+                # 只读前100行进行探测
+                for i in range(100):
+                    line = f.readline()
+                    try:
+                        line_str = line.decode('gb18030', errors='ignore')
+                    except:
+                        continue
+                    if 'Time' in line_str and 'Data Channels' in line_str:
+                        data_start_line = i + 1
+                        break
+        except Exception as e:
+            print(f"[Warn] Header detection failed for {txt_path}: {e}, using default {data_start_line}")
+
+        return data_start_line
+
     def process_txt_files(self, txt_paths: list, output_path: Optional[str] = None):
         """
-        处理多个TXT文件
-
-        Args:
-            txt_paths: TXT文件路径列表（绝对路径）
-            output_path: 输出结果文件路径（可选）
+        [Modified] 流式处理多个TXT文件，极低内存占用
         """
-        print(f">>> Processing {len(txt_paths)} TXT files...")
+        print(f">>> Processing {len(txt_paths)} TXT files (Streaming Mode)...")
 
-        # 读取并合并所有TXT文件的数据
-        all_vib_data = []
-        all_audio_data = []
-        all_speed_data = []
-        all_current_data = []
+        # 实时模拟参数
+        sim_step_size = 5120  # 每次推进0.1秒 (对应哨兵模式的刷新率)
+        disk_chunk_size = 51200  # 每次从磁盘读取1秒数据 (减少IO次数)
 
-        for txt_path in txt_paths:
-            print(f"    Reading: {os.path.basename(txt_path)}")
-
-            # 读取TXT文件
-            data = self.read_txt_file(txt_path)
-            if data is None:
-                print(f"    [Skip] Failed to read {txt_path}")
-                continue
-
-            # 提取通道
-            vib_data, audio_data, speed_data, current_data = self.extract_channels(data)
-
-            all_vib_data.append(vib_data)
-            all_audio_data.append(audio_data)
-            all_speed_data.append(speed_data)
-            all_current_data.append(current_data)
-
-            print(
-                f"        Shape: {data.shape} -> Vib={vib_data.shape}, Audio={audio_data.shape}, Speed={speed_data.shape}, Current={current_data.shape}")
-
-        if len(all_vib_data) == 0:
-            print("[Error] No valid data loaded")
-            return
-
-        # 合并所有文件的数据
-        vib_data = np.concatenate(all_vib_data, axis=0)
-        audio_data = np.concatenate(all_audio_data, axis=0)
-        speed_data = np.concatenate(all_speed_data, axis=0)
-        current_data = np.concatenate(all_current_data, axis=0)
-
-        print(
-            f"\n    Total data shape: Vib={vib_data.shape}, Audio={audio_data.shape}, Speed={speed_data.shape}, Current={current_data.shape}")
-
-        # 结果记录
+        total_processed_samples = 0
         results = []
 
-        # 模拟实时处理（按采样率处理）
-        sample_rate = SAMPLE_RATE  # 51200 Hz
-        chunk_size = sample_rate // 10  # 每0.1秒处理一次（10Hz）
+        # CPU 监控
+        process_monitor = psutil.Process()
+        process_monitor.cpu_percent()
+        cpu_usages = []
 
-        total_samples = len(vib_data)
-        processed = 0
+        print(f"\n>>> Starting streaming processing...")
+        print(f"    Disk Chunk: {disk_chunk_size} samples")
+        print(f"    Sim Step  : {sim_step_size} samples (0.1s system tick)")
 
-        print(f"\n>>> Starting real-time processing...")
-        print(f"    Chunk size: {chunk_size} samples (0.1s)")
-        print(f"    Total samples: {total_samples}\n")
+        start_time_wall = time.time()
 
-        while processed < total_samples:
-            # 计算当前时间
-            current_time = time.time()
+        for txt_path in txt_paths:
+            print(f"\n    [Stream] Opening: {os.path.basename(txt_path)}")
 
-            # 检查冷却期
-            if current_time < self.cooldown_until:
-                # 冷却期内，强制使用哨兵模式
-                self.current_mode = "sentinel"
+            # 1. 探测起始行
+            skip_rows = self.detect_header_line(txt_path)
 
-            # 获取数据块
-            end_idx = min(processed + chunk_size, total_samples)
-            vib_chunk = vib_data[processed:end_idx]
-            audio_chunk = audio_data[processed:end_idx]
-            speed_chunk = speed_data[processed:end_idx]
-            current_chunk = current_data[processed:end_idx]
+            # 2. 创建流式读取器 (Iterator)
+            try:
+                # 注意：这里使用了 chunksize，pandas 不会一次性读取文件
+                reader = pd.read_csv(
+                    txt_path,
+                    sep='\t',
+                    encoding='gb18030',  # 或 gbk
+                    header=None,
+                    skiprows=skip_rows,
+                    engine='c',  # c 引擎更快，内存更少
+                    chunksize=disk_chunk_size,
+                    on_bad_lines='skip'
+                )
+            except Exception as e:
+                print(f"    [Error] Failed to open stream {txt_path}: {e}")
+                continue
 
-            # 根据模式处理
-            if self.current_mode == "sentinel":
-                # 哨兵模式
-                self.sentinel.add_data(vib_chunk, audio_chunk, speed_chunk)
-                spe, is_anomaly = self.sentinel.process()
-                self.stats['sentinel_calls'] += 1
+            # 3. 逐块读取磁盘数据
+            for chunk_df in reader:
+                # 提取数据 (此时 chunk_df 只有 disk_chunk_size 行，内存很小)
+                # 注意：extract_channels 需要适配 DataFrame 或 numpy
+                raw_data = chunk_df.values
+                vib_chunk_large, audio_chunk_large, speed_chunk_large, current_chunk_large = self.extract_channels(
+                    raw_data)
 
-                if is_anomaly:
-                    self.stats['anomalies_detected'] += 1
-                    print(f"[Sentinel] Anomaly detected! SPE={spe:.4f} > {self.sentinel.threshold:.4f}")
-                    # 切换到专家模式
-                    self.current_mode = "expert"
-                    # 清空专家模式缓冲区，准备接收新数据
-                    self.expert.buffer_vib = []
-                    self.expert.buffer_audio = []
-                    self.expert.buffer_speed = []
-                    self.expert.buffer_current = []
+                # 4. 将大块数据切分为微小的“时间片”来喂给系统
+                # 这是为了模拟真实的时间流逝，保证能及时切换模式
+                num_steps = (len(vib_chunk_large) + sim_step_size - 1) // sim_step_size
 
-                results.append({
-                    'time': processed / sample_rate,
-                    'mode': 'sentinel',
-                    'spe': spe,
-                    'is_anomaly': is_anomaly,
-                    'fault_class': None,
-                    'confidence': None
-                })
+                for i in range(num_steps):
+                    s_idx = i * sim_step_size
+                    e_idx = min(s_idx + sim_step_size, len(vib_chunk_large))
 
-            else:
-                # 专家模式
-                self.expert.add_data(vib_chunk, audio_chunk, speed_chunk, current_chunk)
-                class_id, class_name, confidence = self.expert.process()
-                self.stats['expert_calls'] += 1
+                    if s_idx >= len(vib_chunk_large):
+                        break
 
-                if class_id >= 0:
-                    self.stats['faults_diagnosed'] += 1
-                    print(f"[Expert] Fault diagnosed: {class_name} (Confidence: {confidence:.2%})")
+                    # 获取当前的微批次数据 (0.1秒)
+                    vib_step = vib_chunk_large[s_idx:e_idx]
+                    audio_step = audio_chunk_large[s_idx:e_idx]
+                    speed_step = speed_chunk_large[s_idx:e_idx]
+                    current_step = current_chunk_large[s_idx:e_idx]
 
-                    results.append({
-                        'time': processed / sample_rate,
-                        'mode': 'expert',
-                        'spe': None,
-                        'is_anomaly': None,
-                        'fault_class': class_name,
-                        'confidence': confidence
-                    })
+                    current_sim_time = total_processed_samples / SAMPLE_RATE
 
-                    # 诊断完成，返回哨兵模式并设置冷却期
-                    self.current_mode = "sentinel"
-                    self.cooldown_until = current_time + self.cooldown_duration
-                    print(f"[System] Returning to Sentinel Mode (Cooldown: {self.cooldown_duration}s)")
+                    # --- 系统逻辑核心 (保持与原版一致，但逻辑前移) ---
 
-            processed = end_idx
+                    # 检查冷却期 (使用模拟时间还是挂钟时间？这里建议用模拟时间保证结果可复现，或者挂钟时间模拟真实延迟)
+                    # 为了简单的复现性，这里我们检查系统状态，如果需要模拟真实时间流逝：
+                    # if time.time() < self.cooldown_until: ...
 
-            # 显示进度
-            if processed % (sample_rate * 5) == 0:  # 每5秒显示一次
-                progress = processed / total_samples * 100
-                print(f"    Progress: {progress:.1f}% ({processed}/{total_samples} samples)")
+                    # 这里使用简单的逻辑：如果cooldown计数器 > 0，则递减
+                    # (由于这里是离线文件模拟，我们用 system_time 判断)
+                    is_in_cooldown = (current_sim_time < self.cooldown_until_sim_time) if hasattr(self,
+                                                                                                  'cooldown_until_sim_time') else False
 
-        # 保存结果
+                    if is_in_cooldown:
+                        self.current_mode = "sentinel"
+
+                    # 根据模式处理
+                    if self.current_mode == "sentinel":
+                        self.sentinel.add_data(vib_step, audio_step, speed_step)
+                        # 尝试处理 (Sentinel 内部会判断数据是否足够一个窗口)
+                        # 注意：process() 会消耗掉 hop_size 的数据
+
+                        # 循环调用 process 直到缓冲区不足 (应对边界情况)
+                        while True:
+                            spe, is_anomaly, lat = self.sentinel.process()
+                            if lat == 0.0:  # 没有发生处理(数据不够)
+                                break
+
+                            self.stats['sentinel_calls'] += 1
+
+                            if is_anomaly:
+                                self.stats['anomalies_detected'] += 1
+                                print(f"[Sentinel @ {current_sim_time:.2f}s] Anomaly! SPE={spe:.4f}")
+
+                                # 切换到专家模式
+                                self.current_mode = "expert"
+                                # 清空专家缓冲区
+                                self.expert.buffer_vib = []
+                                self.expert.buffer_audio = []
+                                self.expert.buffer_speed = []
+                                self.expert.buffer_current = []
+
+                                # 专家模式需要重新积累数据，所以当前循环可能不再产生输出
+                                break
+
+                            results.append({
+                                'time': current_sim_time,
+                                'mode': 'sentinel',
+                                'spe': spe,
+                                'is_anomaly': is_anomaly,
+                                'fault_class': None,
+                                'confidence': None
+                            })
+
+                    else:  # Expert Mode
+                        self.expert.add_data(vib_step, audio_step, speed_step, current_step)
+
+                        while True:
+                            class_id, class_name, confidence, lat = self.expert.process()
+                            if class_id == -1:  # 数据不够
+                                break
+
+                            self.stats['expert_calls'] += 1
+                            self.stats['faults_diagnosed'] += 1
+                            print(f"[Expert @ {current_sim_time:.2f}s] Diagnosis: {class_name} ({confidence:.1%})")
+
+                            results.append({
+                                'time': current_sim_time,
+                                'mode': 'expert',
+                                'spe': None,
+                                'is_anomaly': None,
+                                'fault_class': class_name,
+                                'confidence': confidence
+                            })
+
+                            # 诊断完成，切回哨兵
+                            self.current_mode = "sentinel"
+                            # 设置冷却时间 (模拟时间 + 3秒)
+                            self.cooldown_until_sim_time = current_sim_time + self.cooldown_duration
+                            print(f"[System] Cooldown until {self.cooldown_until_sim_time:.2f}s")
+                            break  # 切回哨兵后，跳出循环等待新数据
+
+                    # 更新总样本数
+                    total_processed_samples += len(vib_step)
+
+                # --- 结束微批次循环 ---
+
+                # 监控 CPU (每读取一次磁盘大块记录一次)
+                cpu_usages.append(process_monitor.cpu_percent())
+
+                # 打印进度 (可选)
+                # print(f"    ... processed {total_processed_samples} samples", end='\r')
+
+        # 处理结束
+        duration = time.time() - start_time_wall
+        print(f"\n>>> Streaming Finished in {duration:.2f}s")
+        print(f"    Total Samples: {total_processed_samples}")
+
         if output_path:
-            results_df = pd.DataFrame(results)
-            results_df.to_csv(output_path, index=False)
-            print(f"\n>>> Results saved to: {output_path}")
+            # 转换结果为DF并保存
+            pd.DataFrame(results).to_csv(output_path, index=False)
+            print(f"    Results saved to {output_path}")
 
-        # 打印统计信息
+        # 打印原有统计
         print(f"\n{'=' * 60}")
-        print(f">>> Processing Complete")
         print(f"    Sentinel calls: {self.stats['sentinel_calls']}")
         print(f"    Expert calls: {self.stats['expert_calls']}")
-        print(f"    Anomalies detected: {self.stats['anomalies_detected']}")
-        print(f"    Faults diagnosed: {self.stats['faults_diagnosed']}")
+        print(f"    Anomalies: {self.stats['anomalies_detected']}")
+        print(f"    Faults: {self.stats['faults_diagnosed']}")
         print(f"{'=' * 60}\n")
-
 
 def main():
     import argparse
