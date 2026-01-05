@@ -20,6 +20,8 @@ from typing import Optional, Tuple, Dict, Any
 from scipy.signal import decimate
 from collections import deque
 import psutil  # 新增: 用于监控CPU和内存
+import csv
+import datetime
 
 # 简化配置（不依赖完整Config类）
 SAMPLE_RATE = 51200
@@ -424,26 +426,42 @@ class ExpertPreprocessor:
         except Exception:
             mfcc = np.zeros(CH4_AUDIO_DIM, dtype=np.float32)
 
-        # 标准化处理
+        # ---------------------------------------------------------------------
+        # [Fix] 1. 先进行对数变换 (Log Transform first)
+        #       这一步是为了压缩数据的动态范围，处理长尾分布
+        # ---------------------------------------------------------------------
+        fft_micro = np.log1p(fft_micro)
+        fft_macro = np.log1p(fft_macro)
+        fft_curr = np.log1p(fft_curr)
+        # 注意：mfcc 在提取时已经做过 log10，这里不需要再次 log
+
+        # ---------------------------------------------------------------------
+        # [Fix] 2. 后进行标准化 (Standardization second)
+        #       确保输入模型的特征符合标准正态分布 (0 mean, 1 std)
+        # ---------------------------------------------------------------------
         if self.scaler is not None:
+            # 使用 scaler 中的参数 (这些参数应该是基于 log 后的数据计算出来的)
             fft_micro = (fft_micro - self.scaler.get('micro_mean', 0)) / (self.scaler.get('micro_std', 1) + 1e-6)
             fft_macro = (fft_macro - self.scaler.get('macro_mean', 0)) / (self.scaler.get('macro_std', 1) + 1e-6)
+
+            # MFCC 本身就可以直接标准化
             mfcc = (mfcc - self.scaler.get('ac_mean', 0)) / (self.scaler.get('ac_std', 1) + 1e-6)
-            fft_curr = (fft_curr - self.scaler.get('curr_spec_mean', 0)) / (self.scaler.get('curr_spec_std', 1) + 1e-6)
+
+            fft_curr = (fft_curr - self.scaler.get('curr_spec_mean', 0)) / (
+                        self.scaler.get('curr_spec_std', 1) + 1e-6)
 
             # 负载归一化
             curr_rms_ref = self.scaler.get('curr_rms_ref', 1.0)
             load_proxy = curr_rms / (curr_rms_ref + 1e-6)
             load_proxy = np.clip(load_proxy, 0.0, 3.0)
         else:
-            load_proxy = curr_rms / 100.0  # 简单归一化
+            # 兜底逻辑
+            load_proxy = curr_rms / 100.0
             load_proxy = np.clip(load_proxy, 0.0, 3.0)
 
-        # 对数变换
-        fft_micro = np.log1p(fft_micro)
-        fft_macro = np.log1p(fft_macro)
-        fft_curr = np.log1p(fft_curr)
-
+        # ---------------------------------------------------------------------
+        # 返回结果
+        # ---------------------------------------------------------------------
         return {
             'micro': fft_micro.astype(np.float32),
             'macro': fft_macro.astype(np.float32),
@@ -842,17 +860,48 @@ class TwoTierDiagnosisSystem:
         """
         print(f">>> Processing {len(txt_paths)} TXT files (Streaming Mode)...")
 
+        # 兜底逻辑：如果未指定输出路径，自动生成默认文件名
+        if output_path is None:
+            timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"diagnosis_results_{timestamp_str}.csv"
+            print(f"    [Warn] No output path specified. Using default: {output_path}")
+
+        # 定义 CSV 表头
+        csv_headers = [
+            'Timestamp',
+            'Mode',
+            'Sentinel_Result',
+            'Expert_Diagnosis',
+            'Confidence',
+            'SPE',
+            'Sentinel_Time_ms',  # 哨兵推理时间
+            'Expert_Time_ms',  # 专家推理时间
+            'CPU_Usage_%'  # 当前CPU使用率
+        ]
+
+        # 初始化 CSV 文件
+        if output_path:
+            try:
+                with open(output_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(csv_headers)
+                print(f"    [IO] CSV initialized at: {output_path}")
+            except Exception as e:
+                print(f"    [Error] Failed to init CSV: {e}")
+                output_path = None
+
         # 实时模拟参数
         sim_step_size = 5120  # 每次推进0.1秒 (对应哨兵模式的刷新率)
         disk_chunk_size = 51200  # 每次从磁盘读取1秒数据 (减少IO次数)
-
         total_processed_samples = 0
         results = []
 
+        # 状态变量：记录触发专家模式时的那个 SPE 值
+        triggering_spe = "N/A"
+
         # CPU 监控
         process_monitor = psutil.Process()
-        process_monitor.cpu_percent()
-        cpu_usages = []
+        process_monitor.cpu_percent(interval=None)
 
         print(f"\n>>> Starting streaming processing...")
         print(f"    Disk Chunk: {disk_chunk_size} samples")
@@ -910,33 +959,48 @@ class TwoTierDiagnosisSystem:
 
                     current_sim_time = total_processed_samples / SAMPLE_RATE
 
-                    # --- 系统逻辑核心 (保持与原版一致，但逻辑前移) ---
-
-                    # 检查冷却期 (使用模拟时间还是挂钟时间？这里建议用模拟时间保证结果可复现，或者挂钟时间模拟真实延迟)
-                    # 为了简单的复现性，这里我们检查系统状态，如果需要模拟真实时间流逝：
-                    # if time.time() < self.cooldown_until: ...
-
-                    # 这里使用简单的逻辑：如果cooldown计数器 > 0，则递减
-                    # (由于这里是离线文件模拟，我们用 system_time 判断)
-                    is_in_cooldown = (current_sim_time < self.cooldown_until_sim_time) if hasattr(self,
-                                                                                                  'cooldown_until_sim_time') else False
-
-                    if is_in_cooldown:
+                    # 检查冷却时间
+                    if hasattr(self, 'cooldown_until_sim_time') and current_sim_time < self.cooldown_until_sim_time:
                         self.current_mode = "sentinel"
+
+                    row_data = None
 
                     # 根据模式处理
                     if self.current_mode == "sentinel":
                         self.sentinel.add_data(vib_step, audio_step, speed_step)
-                        # 尝试处理 (Sentinel 内部会判断数据是否足够一个窗口)
-                        # 注意：process() 会消耗掉 hop_size 的数据
 
                         # 循环调用 process 直到缓冲区不足 (应对边界情况)
                         while True:
+                            process_monitor.cpu_percent(interval=None) # 1. 测量前重置计数器 (忽略非计算时间的消耗)
+
                             spe, is_anomaly, lat = self.sentinel.process()
+
+                            current_cpu = process_monitor.cpu_percent(interval=None) # 2. 测量后立即获取，得到处理期间的 CPU 占用
+
                             if lat == 0.0:  # 没有发生处理(数据不够)
                                 break
 
                             self.stats['sentinel_calls'] += 1
+
+                            sentinel_res = "Anomaly" if is_anomaly else "Normal"
+                            current_spe_str = f"{spe:.4f}"
+
+                            # 如果发现异常，记录这个 SPE，以便稍后传给专家模式
+                            if is_anomaly:
+                                triggering_spe = current_spe_str
+
+                            # 准备 CSV 行
+                            row_data = [
+                                f"{current_sim_time:.3f}",
+                                "Sentinel",
+                                sentinel_res,
+                                "N/A",
+                                "N/A",
+                                current_spe_str,
+                                f"{lat:.2f}",  # Sentinel Time
+                                "N/A",  # Expert Time
+                                f"{current_cpu:.1f}"
+                            ]
 
                             if is_anomaly:
                                 self.stats['anomalies_detected'] += 1
@@ -951,7 +1015,16 @@ class TwoTierDiagnosisSystem:
                                 self.expert.buffer_current = []
 
                                 # 专家模式需要重新积累数据，所以当前循环可能不再产生输出
+                                # 写入当前这一行（Anomaly），然后跳出循环去积累专家数据
+                                if output_path:
+                                    with open(output_path, 'a', newline='', encoding='utf-8') as f:
+                                        csv.writer(f).writerow(row_data)
                                 break
+
+                            # 如果正常，写入 CSV 并继续下一次微循环
+                            if output_path:
+                                with open(output_path, 'a', newline='', encoding='utf-8') as f:
+                                    csv.writer(f).writerow(row_data)
 
                             results.append({
                                 'time': current_sim_time,
@@ -966,13 +1039,35 @@ class TwoTierDiagnosisSystem:
                         self.expert.add_data(vib_step, audio_step, speed_step, current_step)
 
                         while True:
+                            process_monitor.cpu_percent(interval=None) # 1. 测量前重
+
                             class_id, class_name, confidence, lat = self.expert.process()
+
+                            current_cpu = process_monitor.cpu_percent(interval=None) # 2. 测量后获取 (这里包含了特征提取的繁重计算，数值应比较大)
+
                             if class_id == -1:  # 数据不够
                                 break
 
                             self.stats['expert_calls'] += 1
                             self.stats['faults_diagnosed'] += 1
                             print(f"[Expert @ {current_sim_time:.2f}s] Diagnosis: {class_name} ({confidence:.1%})")
+
+                            # 准备 CSV 行
+                            row_data = [
+                                f"{current_sim_time:.3f}",
+                                "Expert",
+                                "Anomaly (Confirmed)",
+                                class_name,
+                                f"{confidence:.4f}",
+                                triggering_spe,  # 显示触发这次诊断的SPE
+                                "N/A",  # Sentinel Time
+                                f"{lat:.2f}",  # Expert Time
+                                f"{current_cpu:.1f}"
+                            ]
+
+                            if output_path:
+                                with open(output_path, 'a', newline='', encoding='utf-8') as f:
+                                    csv.writer(f).writerow(row_data)
 
                             results.append({
                                 'time': current_sim_time,
@@ -993,14 +1088,6 @@ class TwoTierDiagnosisSystem:
                     # 更新总样本数
                     total_processed_samples += len(vib_step)
 
-                # --- 结束微批次循环 ---
-
-                # 监控 CPU (每读取一次磁盘大块记录一次)
-                cpu_usages.append(process_monitor.cpu_percent())
-
-                # 打印进度 (可选)
-                # print(f"    ... processed {total_processed_samples} samples", end='\r')
-
         # 处理结束
         duration = time.time() - start_time_wall
         print(f"\n>>> Streaming Finished in {duration:.2f}s")
@@ -1008,7 +1095,6 @@ class TwoTierDiagnosisSystem:
 
         if output_path:
             # 转换结果为DF并保存
-            pd.DataFrame(results).to_csv(output_path, index=False)
             print(f"    Results saved to {output_path}")
 
         # 打印原有统计

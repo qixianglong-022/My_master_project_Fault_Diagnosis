@@ -12,13 +12,48 @@ import matplotlib as mpl
 ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 模型元数据
+# ================= 配置区域 =================
+ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 模型元数据 (已更新为参数量 Params (K))
+# 数据来源: ch3 相关模型统计
 MODEL_META = {
-    'RDLinear': {'lat': 2.5, 'type': 'Linear', 'color': '#d62728', 'marker': 'o', 'label': 'RDLinear(Ours)'},
-    'TiDE': {'lat': 6.0, 'type': 'MLP', 'color': '#ff7f0e', 'marker': '^', 'label': 'TiDE'},
-    'Transformer': {'lat': 18.5, 'type': 'Transformer', 'color': '#1f77b4', 'marker': 's', 'label': 'Transformer'},
-    'DLinear': {'lat': 1.8, 'type': 'Linear', 'color': '#7f7f7f', 'marker': 'p', 'label': 'DLinear'},
-    'LSTMAE': {'lat': 12.4, 'type': 'RNN', 'color': '#2ca02c', 'marker': 'D', 'label': 'LSTMAE'}
+    'RDLinear': {
+        'params': 3.91,      # 3.91K
+        'type': 'Linear',
+        'color': '#d62728',
+        'marker': 'o',
+        'label': 'RDLinear(Ours)'
+    },
+    'TiDE': {
+        'params': 576.07,    # 576.07K (ch3_TiDE)
+        'type': 'MLP',
+        'color': '#ff7f0e',
+        'marker': '^',
+        'label': 'TiDE'
+    },
+    'Transformer': {
+        'params': 423.00,    # 423.00K
+        'type': 'Transformer',
+        'color': '#1f77b4',
+        'marker': 's',
+        'label': 'Transformer'
+    },
+    'DLinear': {
+        'params': 3.78,      # 3.78K
+        'type': 'Linear',
+        'color': '#7f7f7f',
+        'marker': 'p',
+        'label': 'DLinear'
+    },
+    'LSTMAE': {
+        'params': 124.12,    # 124.12K
+        'type': 'RNN',
+        'color': '#2ca02c',
+        'marker': 'D',
+        'label': 'LSTMAE'
+    }
 }
 
 
@@ -223,45 +258,53 @@ def plot_bar_robustness(df, fonts):
 
 
 def plot_scatter_efficiency(df, fonts):
-    """图3：散点图"""
+    """图3：散点图 (模型参数量 vs 精度) - 精简版"""
     avg_perf = df.groupby('Model')['AUC'].mean().reset_index()
-    avg_perf['Latency'] = avg_perf['Model'].apply(lambda x: MODEL_META[x]['lat'])
+    # 获取参数量
+    avg_perf['Params'] = avg_perf['Model'].apply(lambda x: MODEL_META[x]['params'])
     avg_perf['Label'] = avg_perf['Model'].apply(lambda x: MODEL_META[x]['label'])
 
     plt.figure(figsize=(9, 6))
 
+    # 绘制散点
     for _, row in avg_perf.iterrows():
         meta = MODEL_META[row['Model']]
-        plt.scatter(row['Latency'], row['AUC'], c=meta['color'], marker=meta['marker'], s=400,
+        plt.scatter(row['Params'], row['AUC'], c=meta['color'], marker=meta['marker'], s=400,
                     edgecolor='white', linewidth=1.5, zorder=5)
 
-        xytext = (0, 15)
-        if 'DLinear' in row['Model']: xytext = (0, -35)
-        if 'Transformer' in row['Model']: xytext = (-20, -25)
-        if 'RDLinear' in row['Model']: xytext = (0, 20)
-
-        plt.annotate(row['Label'], (row['Latency'], row['AUC']),
-                     xytext=xytext, textcoords='offset points',
-                     ha='center', fontweight='bold', color='black',
+        # [修改点 1] 所有标签统一放到图标下方
+        plt.annotate(row['Label'], (row['Params'], row['AUC']),
+                     xytext=(0, -20),  # 统一向下偏移 20 points
+                     textcoords='offset points',
+                     ha='center',  # 水平居中
+                     va='top',  # 垂直顶部对齐(即文字挂在点下方)
+                     fontweight='bold', color='black',
                      fontproperties=fonts.note)
 
-    plt.arrow(16, 0.70, -12, 0.20, head_width=0.02, head_length=1, fc='gray', ec='gray', alpha=0.3)
-    plt.text(4, 0.92, "理想区域\n(快且准)", color='gray', fontweight='bold', fontproperties=fonts.label)
+    # 设置对数坐标轴
+    plt.xscale('log')
 
-    # [关键修改] 应用层级字体
-    plt.xlabel(r"推理延迟 (ms) $\leftarrow$ 更快 (边缘端实测)", fontproperties=fonts.label)
-    plt.ylabel(r"全工况平均 AUC $\rightarrow$ 更准", fontproperties=fonts.label)
-    plt.xticks(fontproperties=fonts.tick)
+    # 手动设置 X 轴刻度
+    xticks = [3, 10, 100, 500, 1000]
+    plt.xticks(xticks, [str(x) for x in xticks], fontproperties=fonts.tick)
+
+    # [修改点 2] 移除"理想区域"箭头和文字
+    # (此处已删除相关代码)
+
+    # [修改点 3] 简化坐标轴标签
+    plt.xlabel("模型参数量 (KB,对数坐标)", fontproperties=fonts.label)
+    plt.ylabel("全工况平均 AUC", fontproperties=fonts.label)
+
     plt.yticks(fontproperties=fonts.tick)
-    plt.title("模型精度与计算效率权衡分析", y=1.03, fontproperties=fonts.title)
+    plt.title("模型精度与参数规模权衡分析", y=1.03, fontproperties=fonts.title)
 
-    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.grid(True, linestyle='--', alpha=0.5, which='both')
     plt.ylim(0.6, 1.02)
-    plt.xlim(0, 22)
+    plt.xlim(2, 1000)
 
-    out_path = os.path.join(OUTPUT_DIR, 'Fig3_Scatter_Efficiency.pdf')
+    out_path = os.path.join(OUTPUT_DIR, 'Fig3_Scatter_Efficiency_Params_Clean.pdf')
     plt.savefig(out_path, bbox_inches='tight')
-    print(f">>> 图3 保存完毕")
+    print(f">>> 图3 (精简版) 保存完毕")
     plt.close()
 
 
@@ -280,8 +323,8 @@ if __name__ == "__main__":
     if df is not None:
         print(">>> 开始生成图表...")
         try:
-            plot_radar(df, fm_sys)
-            plot_bar_robustness(df, fm_sys)
+            # plot_radar(df, fm_sys)
+            # plot_bar_robustness(df, fm_sys)
             plot_scatter_efficiency(df, fm_sys)
             print("\n>>> 所有图表生成完毕！")
         except Exception as e:
