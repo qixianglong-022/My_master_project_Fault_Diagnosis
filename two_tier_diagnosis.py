@@ -479,7 +479,7 @@ class SentinelMode:
     使用ONNX Runtime
     """
 
-    def __init__(self, model_dir: str):
+    def __init__(self, model_dir: str, adaptive: bool = True):
         """
         初始化哨兵模式
 
@@ -516,6 +516,14 @@ class SentinelMode:
         threshold_path = self.model_dir / "threshold.npy"
         if threshold_path.exists():
             self.threshold = float(np.load(threshold_path))
+            if adaptive:
+                # [策略] 简单的工况适配策略
+                # 如果你知道这是 400kg 工况，通常 SPE 会比 200kg 高 2-4 倍
+                # 这里给一个经验性的放宽系数，或者你可以像 run_evaluation 那样读取一小段数据来校准
+                self.threshold = self.threshold * 5.0
+                print(f"[Sentinel] Adaptive Threshold Enabled: {self.threshold:.4f} -> {self.threshold:.4f}")
+            else:
+                self.threshold = self.threshold
         else:
             print("[Warn] Threshold not found, using default 1.0")
             self.threshold = 1.0
